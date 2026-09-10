@@ -64,6 +64,11 @@ function(add_kpm_module MODULE_NAME)
         -mcmodel=large
         -fno-asynchronous-unwind-tables
         -fno-unwind-tables
+        # x18 is the kernel shadow-call-stack pointer on SCS-enabled GKI
+        # kernels (Pixel/android14). KPM code must never allocate it;
+        # otherwise scs_pop reads x30 from wherever x18 was left pointing
+        # and the next ret jumps to garbage (SP/PC alignment panic).
+        -ffixed-x18
     )
 
 

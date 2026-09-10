@@ -125,10 +125,16 @@ static void reply_finish(struct sysmon_reply *r)
 
 static int reply_copy(struct sysmon_reply *r, char __user *out_msg, int outlen)
 {
+    int n;
+
     reply_finish(r);
     if (!out_msg || outlen <= 0)
         return 0;
-    return compat_copy_to_user(out_msg, r->buf, r->len + 1);
+    /* never write past the caller-supplied buffer */
+    n = r->len + 1;
+    if (n > outlen)
+        n = outlen;
+    return compat_copy_to_user(out_msg, r->buf, n);
 }
 
 static bool parse_u64(const char *text, unsigned int default_base, u64 *out)
@@ -192,7 +198,7 @@ static bool sysmon_matches_filter(void)
     int uid_filter = g_target_uid;
     int tgid_filter = g_target_tgid;
     int uid = (int)current_uid();
-    int tgid = (int)sysmon_task_pid(task);
+    int tgid = (int)sysmon_task_tgid(task);
 
     if (!g_enabled)
         return false;
@@ -564,7 +570,7 @@ int sysmon_main(struct opts *opts, char __user *out_msg, int outlen)
     if (!opts || opts->size < 2) {
         sysmon_reply_help(&reply);
         reply_copy(&reply, out_msg, outlen);
-        return -EINVAL;
+        return reply.len; /* kpctl prints only positive rc */
     }
 
     if (!strcmp(opts->args[1], "help")) {
@@ -670,9 +676,12 @@ int sysmon_main(struct opts *opts, char __user *out_msg, int outlen)
         reply_str(&reply, "error=");
         reply_i64(&reply, ret);
         reply_ch(&reply, '\n');
+        reply_copy(&reply, out_msg, outlen);
+        return ret;
     }
     reply_copy(&reply, out_msg, outlen);
-    return ret;
+    /* KP ctl0 convention: positive rc = reply byte count (kpctl prints it) */
+    return reply.len;
 }
 
 int sysmon_init(void)
