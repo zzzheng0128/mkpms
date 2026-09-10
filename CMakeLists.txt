@@ -96,7 +96,8 @@ endfunction()
 # 包含modules目录下的所有子目录作为子项目
 file(GLOB CHILD_MODULES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/kpms ${CMAKE_CURRENT_SOURCE_DIR}/kpms/*)
 foreach(child ${CHILD_MODULES})
-    if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/kpms/${child}")
+    if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/kpms/${child}"
+            AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kpms/${child}/CMakeLists.txt")
         add_subdirectory(kpms/${child})
     endif()
 endforeach()

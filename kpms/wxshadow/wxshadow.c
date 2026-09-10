@@ -16,11 +16,13 @@
 #define __NR_prctl 167
 #endif
 
+#ifndef MKPM_MERGED
 KPM_NAME("wxshadow");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("wxshadow");
 KPM_DESCRIPTION("W^X Shadow Memory - Hidden Breakpoint Mechanism");
+#endif
 
 /* ========== Global variable definitions ========== */
 
@@ -1344,7 +1346,11 @@ static void wx_unregister_brk_step_hooks(void)
 
 /* ========== Module init/exit ========== */
 
+#ifdef MKPM_MERGED
+long wxshadow_init(const char *args, const char *event, void *__user reserved)
+#else
 static long wxshadow_init(const char *args, const char *event, void *__user reserved)
+#endif
 {
     int ret;
 
@@ -1590,7 +1596,11 @@ static void wait_for_handlers_drain(const char *phase)
                 phase, iters);
 }
 
+#ifdef MKPM_MERGED
+long wxshadow_exit(void *__user reserved)
+#else
 static long wxshadow_exit(void *__user reserved)
+#endif
 {
     int page_count = 0;
 
@@ -1699,12 +1709,18 @@ static long wxshadow_exit(void *__user reserved)
     return 0;
 }
 
+#ifdef MKPM_MERGED
+long wxshadow_control(const char *args, char *__user out_msg, int outlen)
+#else
 static long wxshadow_control(const char *args, char *__user out_msg, int outlen)
+#endif
 {
     pr_info("wxshadow: control called with args: %s\n", args ? args : "(null)");
     return 0;
 }
 
+#ifndef MKPM_MERGED
 KPM_INIT(wxshadow_init);
 KPM_CTL0(wxshadow_control);
 KPM_EXIT(wxshadow_exit);
+#endif

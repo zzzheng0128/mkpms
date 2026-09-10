@@ -22,11 +22,18 @@ mkpms/
 │   ├── demo-hello/
 │   ├── demo-inlinehook/
 │   ├── demo-syscallhook/
-│   ├── hide-maps/
-│   └── wxshadow/    # W^X Shadow 断点隐藏模块
+│   ├── hide-maps/   # hide-so v1.2.0 源码 (hidemaps.c, 被 mkpm 链接, 无独立 target)
+│   ├── wxshadow/    # W^X Shadow 断点隐藏 (源码, 被 mkpm 链接)
+│   └── mkpm/        # ★ 唯一 KPM: hide-so + wxshadow + dysvcpit 合并模块
+│       ├── main.c        # ctl0 首词分发: hide/wxshadow/syscall/ehide/eredirect/evm/emaps/status
+│       └── dysvcpit/     # dysvcpit 移植源码 (sysmon/opts/ehide/eredirect/evm/emaps)
 ├── CMakeLists.txt
 └── hello.lds
 ```
+
+**构建约定 (2026-09-10 起): 只产出一个 mkpm.kpm**。hide-maps/wxshadow 不再单独构建;
+合并编译需 `-DMKPM_MERGED` (剥离各源文件 KPM_* 入口宏)。hide-so/wxshadow 默认开启,
+dysvcpit 各模块 ctl0 首次调用时懒 init。hwbprw/bp/rwmem 未合并 (字符设备易暴露)。
 
 ## 编译
 

@@ -123,10 +123,58 @@ int wxshadow_handle_exec_fault(void *mm, unsigned long addr)
  * do_page_fault hook - intercept page faults for wxshadow pages
  * Signature: int do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *regs)
  */
+static bool wxshadow_mm_has_live_pages(void *mm)
+{
+    struct list_head *pos;
+    bool found = false;
+
+    spin_lock(&global_lock);
+    list_for_each(pos, &page_list) {
+        struct wxshadow_page *p =
+            container_of(pos, struct wxshadow_page, list);
+
+        if (p->mm == mm && !p->dead && p->pfn_shadow) {
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&global_lock);
+
+    return found;
+}
+
+static void wxshadow_log_unhandled_exec_fault(void *mm, unsigned long far,
+                                              unsigned int esr,
+                                              enum wxshadow_fault_access access,
+                                              struct pt_regs *regs)
+{
+    const char *comm;
+    pid_t pid = -1;
+    pid_t tgid = -1;
+
+    if (access != WXSHADOW_FAULT_EXEC)
+        return;
+    if (!regs || !user_mode(regs))
+        return;
+    if (!wxshadow_mm_has_live_pages(mm))
+        return;
+
+    if (wxfunc(__task_pid_nr_ns)) {
+        pid = wxfunc(__task_pid_nr_ns)(current, PIDTYPE_PID, NULL);
+        tgid = wxfunc(__task_pid_nr_ns)(current, PIDTYPE_TGID, NULL);
+    }
+    comm = get_task_comm(current);
+
+    pr_warn("wxshadow: [fault_probe] unhandled exec fault comm=\"%.16s\" pid=%d tgid=%d mm=%px far=%lx esr=%x pc=%lx lr=%llx sp=%llx pstate=%llx\n",
+            comm ? comm : "(null)", pid, tgid, mm, far, esr,
+            regs->pc, regs->regs[30], regs->sp, regs->pstate);
+}
+
 static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
 {
     unsigned long far = (unsigned long)args->arg0;
     unsigned int esr = (unsigned int)(unsigned long)args->arg1;
+    struct pt_regs *regs = (struct pt_regs *)args->arg2;
     enum wxshadow_fault_access access;
     void *mm;
     struct wxshadow_page *page;
@@ -144,6 +192,7 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
     /* Check if this is a wxshadow page at this address */
     page = wxshadow_find_page(mm, far);
     if (!page) {
+        wxshadow_log_unhandled_exec_fault(mm, far, esr, access, regs);
         kfunc_mmput(mm);
         return;
     }
