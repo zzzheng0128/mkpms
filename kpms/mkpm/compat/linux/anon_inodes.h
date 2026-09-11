@@ -6,6 +6,10 @@
  *
  */
 
+/* compat shim: KP header set 缺这个头, dysvcpit 需要 anon_inode_getfd 等
+ * 来给 vm 注入创建匿名 inode。本文件只声明, 实现在内核里, KPM 通过
+ * kallsyms_lookup_name 拿到函数地址调用。 */
+
 #ifndef _LINUX_ANON_INODES_H
 #define _LINUX_ANON_INODES_H
 

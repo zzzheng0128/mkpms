@@ -29,7 +29,13 @@
 #include <linux/pid.h>
 #include <asm/current.h>
 #include <hook.h>
+#include "../mkpm/compat/hook_lifecycle.h"
 #include "../common/kpm_demo_helpers.h"
+
+/* emaps 与 hide-so 共用 show_map 的 after 回调，覆盖 Pixel 6 的
+ * show_map_vma 未实际进入 procfs 渲染链路的情况。 */
+struct seq_file;
+extern void emaps_patch_show(struct seq_file *m, size_t old);
 
 #ifndef MKPM_MERGED
 KPM_MODULE_INFO("kpm-hide-so", "1.2.0", "GPL v2", "wwb",
@@ -135,6 +141,7 @@ static int getattr_state_pos;
 static int hm_enabled = 1;      /* master switch */
 static int hm_hide_maps = 1;    /* maps/smaps/numa_maps/map_files hiding */
 static int hm_hide_threads = 1; /* thread hiding + thread count rewriting */
+static int hm_maps_callback_seen;
 
 #define HM_MAX_TOKENS 8
 #define HM_TOKEN_LEN 32
@@ -832,7 +839,12 @@ static void seq_arg2_before(hook_fargs3_t *args, void *udata)
 
 static void seq_show_after(hook_fargs2_t *args, void *udata)
 {
+    if (!hm_maps_callback_seen) {
+        hm_maps_callback_seen = 1;
+        pr_info("hide-so: show_map callback active\n");
+    }
     filter_map_block((seq_file *)args->arg0, args->local.data0);
+    emaps_patch_show((struct seq_file *)args->arg0, args->local.data0);
 }
 
 static void seq_smap_after(hook_fargs2_t *args, void *udata)
@@ -1102,76 +1114,76 @@ static void unhook_all(void)
 
     for (i = 0; i < 20; i++) {
         if (hook_proc_hidden_single_show[i]) {
-            hook_unwrap(hook_proc_hidden_single_show[i], seq_show_before, proc_hidden_single_show_after);
+            mkpm_unwrap_for_exit(hook_proc_hidden_single_show[i], seq_show_before, proc_hidden_single_show_after);
             hook_proc_hidden_single_show[i] = 0;
         }
     }
     if (hook_proc_tid_stat) {
-        hook_unwrap(hook_proc_tid_stat, seq_show_before, proc_pid_stat_after);
+        mkpm_unwrap_for_exit(hook_proc_tid_stat, seq_show_before, proc_pid_stat_after);
         hook_proc_tid_stat = 0;
     }
     if (hook_proc_tgid_stat) {
-        hook_unwrap(hook_proc_tgid_stat, seq_show_before, proc_pid_stat_after);
+        mkpm_unwrap_for_exit(hook_proc_tgid_stat, seq_show_before, proc_pid_stat_after);
         hook_proc_tgid_stat = 0;
     }
     if (hook_do_task_stat) {
-        hook_unwrap(hook_do_task_stat, seq_show_before, do_task_stat_after);
+        mkpm_unwrap_for_exit(hook_do_task_stat, seq_show_before, do_task_stat_after);
         hook_do_task_stat = 0;
     }
     if (hook_proc_sched_show_task) {
-        hook_unwrap(hook_proc_sched_show_task, seq_arg2_before, proc_sched_show_task_after);
+        mkpm_unwrap_for_exit(hook_proc_sched_show_task, seq_arg2_before, proc_sched_show_task_after);
         hook_proc_sched_show_task = 0;
     }
     if (hook_proc_task_getattr) {
-        hook_unwrap(hook_proc_task_getattr, proc_task_getattr_before, proc_task_getattr_after);
+        mkpm_unwrap_for_exit(hook_proc_task_getattr, proc_task_getattr_before, proc_task_getattr_after);
         hook_proc_task_getattr = 0;
     }
     if (hook_proc_pid_status) {
-        hook_unwrap(hook_proc_pid_status, seq_show_before, proc_pid_status_after);
+        mkpm_unwrap_for_exit(hook_proc_pid_status, seq_show_before, proc_pid_status_after);
         hook_proc_pid_status = 0;
     }
     if (hook_cgroup_pidlist_show) {
-        hook_unwrap(hook_cgroup_pidlist_show, seq_show_before, cgroup_pidlist_show_after);
+        mkpm_unwrap_for_exit(hook_cgroup_pidlist_show, seq_show_before, cgroup_pidlist_show_after);
         hook_cgroup_pidlist_show = 0;
     }
     if (hook_cgroup_procs_show) {
-        hook_unwrap(hook_cgroup_procs_show, seq_show_before, cgroup_procs_show_after);
+        mkpm_unwrap_for_exit(hook_cgroup_procs_show, seq_show_before, cgroup_procs_show_after);
         hook_cgroup_procs_show = 0;
     }
     if (hook_comm_show) {
-        hook_unwrap(hook_comm_show, seq_show_before, comm_show_after);
+        mkpm_unwrap_for_exit(hook_comm_show, seq_show_before, comm_show_after);
         hook_comm_show = 0;
     }
     if (hook_map_files_get_link) {
-        hook_unwrap(hook_map_files_get_link, map_files_get_link_before, 0);
+        mkpm_unwrap_for_exit(hook_map_files_get_link, map_files_get_link_before, 0);
         hook_map_files_get_link = 0;
     }
     if (hook_proc_map_files_lookup) {
-        hook_unwrap(hook_proc_map_files_lookup, proc_map_files_lookup_before, 0);
+        mkpm_unwrap_for_exit(hook_proc_map_files_lookup, proc_map_files_lookup_before, 0);
         hook_proc_map_files_lookup = 0;
     }
     if (hook_proc_task_instantiate) {
-        hook_unwrap(hook_proc_task_instantiate, proc_thread_instantiate_before, 0);
+        mkpm_unwrap_for_exit(hook_proc_task_instantiate, proc_thread_instantiate_before, 0);
         hook_proc_task_instantiate = 0;
     }
     if (hook_proc_pid_instantiate) {
-        hook_unwrap(hook_proc_pid_instantiate, proc_thread_instantiate_before, 0);
+        mkpm_unwrap_for_exit(hook_proc_pid_instantiate, proc_thread_instantiate_before, 0);
         hook_proc_pid_instantiate = 0;
     }
     if (hook_proc_fill_cache) {
-        hook_unwrap(hook_proc_fill_cache, proc_fill_cache_before, 0);
+        mkpm_unwrap_for_exit(hook_proc_fill_cache, proc_fill_cache_before, 0);
         hook_proc_fill_cache = 0;
     }
     if (hook_show_numa_map) {
-        hook_unwrap(hook_show_numa_map, seq_show_before, seq_show_after);
+        mkpm_unwrap_for_exit(hook_show_numa_map, seq_show_before, seq_show_after);
         hook_show_numa_map = 0;
     }
     if (hook_show_smap) {
-        hook_unwrap(hook_show_smap, seq_show_before, seq_smap_after);
+        mkpm_unwrap_for_exit(hook_show_smap, seq_show_before, seq_smap_after);
         hook_show_smap = 0;
     }
     if (hook_show_map) {
-        hook_unwrap(hook_show_map, seq_show_before, seq_show_after);
+        mkpm_unwrap_for_exit(hook_show_map, seq_show_before, seq_show_after);
         hook_show_map = 0;
     }
 }
@@ -1223,8 +1235,10 @@ static long hide_so_init(const char *args, const char *event, void *__user reser
     hm_enabled = 1;
     hm_hide_maps = 1;
     hm_hide_threads = 1;
+    hm_maps_callback_seen = 0;
     hm_reset_tokens();
-    hm_set_prefix("wwb-");
+    /* Thread comm prefix aligned with current rustFrida marker (ReferenceQueueD). */
+    hm_set_prefix("ReferenceQueueD");
     kpm_demo_log_init("hide-so", event, args);
 
     sym_proc_map_files_instantiate = (void *)kallsyms_lookup_name("proc_map_files_instantiate");
@@ -1265,7 +1279,7 @@ static long hide_so_init(const char *args, const char *event, void *__user reser
         hook_one_symbol(proc_hidden_single_show_symbols[i], &hook_proc_hidden_single_show[i], 4,
                         seq_show_before, proc_hidden_single_show_after);
 
-    pr_info("hide-so: installed, filtering token prefix wwb_, proc task/stat/direct and cgroup threads wwb-*\n");
+    pr_info("hide-so: installed, filtering token prefix dalvik-jit-code-cache/qbdi_helper, threads ReferenceQueueD*\n");
     return 0;
 }
 
@@ -1275,7 +1289,10 @@ static void hm_reset_tokens(void)
 {
     hidden_token_count = 0;
     hidden_tokens[0] = 0;
-    hm_add_token("wwb_");
+    /* Defaults aligned with current rustFrida VMA / memfd naming (disguised as
+     * Android system resources). Add extra tokens via 'hide token add <s>'. */
+    hm_add_token("dalvik-jit-code-cache");
+    hm_add_token("qbdi_helper");
 }
 
 static int hm_add_token(const char *token)

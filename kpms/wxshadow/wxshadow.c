@@ -10,6 +10,20 @@
  */
 
 #include "wxshadow_internal.h"
+/* snprintf must go through the KP kfunc table: the loader binds kf_snprintf but
+ * knows nothing about a plain "snprintf" symbol, so a bare extern + call would
+ * fail the load with "unknown symbol: snprintf". <linux/kernel.h> provides the
+ * snprintf -> kfunc(snprintf) macro. */
+#include <linux/kernel.h>
+#include <barrier.h>
+
+/* Global control-plane switch (see wxshadow_internal.h). Default ON. */
+volatile int wxs_enabled = 1;
+volatile int wxs_unloading = 0;
+
+/* NOTE: do NOT declare `extern int snprintf(...)` here. The KP loader resolves
+ * kf_snprintf only; a manual extern reintroduces the bare "snprintf" UND symbol
+ * and the module fails to load. Use <linux/kernel.h>'s macro instead. */
 
 /* prctl syscall number */
 #ifndef __NR_prctl
@@ -1322,6 +1336,21 @@ static int wxshadow_step_hook_fn(struct pt_regs *regs, unsigned int esr)
 
 /* ========== Unload helpers ========== */
 
+/* Defined below, but also used by the init failure rollback paths. */
+static void wait_for_handlers_drain(const char *phase);
+
+/* Stop accepting new wxshadow work before removing a partial set of hooks.
+ * KPM can call init() and then immediately free the module when a later hook
+ * fails, so rollback needs the same gate as the normal exit path. */
+static void wxshadow_begin_unload(const char *phase)
+{
+    wxs_unloading = 1;
+    smp_mb();
+    wxs_enabled = 0;
+    smp_mb();
+    wait_for_handlers_drain(phase);
+}
+
 /*
  * wx_unregister_brk_step_hooks - remove break/step hooks from kernel's
  * debug hook lists under debug_hook_lock.  Safe to call from both the
@@ -1355,6 +1384,8 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
     int ret;
 
     pr_info("wxshadow: initializing...\n");
+    wxs_unloading = 0;
+    wxs_enabled = 1;
 
     /* Resolve kernel symbols */
     ret = resolve_symbols();
@@ -1432,7 +1463,8 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         ret = hook_wrap3(kfunc_single_step_handler, single_step_handler_before, NULL, NULL);
         if (ret != HOOK_NO_ERR) {
             pr_err("wxshadow: failed to hook single_step_handler: %d\n", ret);
-            hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
+            wxshadow_begin_unload("init-rollback-direct");
+            mkpm_unwrap_for_exit(kfunc_brk_handler, brk_handler_before, NULL);
             return -1;
         }
         pr_info("wxshadow: hooked single_step_handler\n");
@@ -1447,10 +1479,11 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
     ret = hook_syscalln(__NR_prctl, 5, prctl_before, NULL, NULL);
     if (ret != HOOK_NO_ERR) {
         pr_err("wxshadow: failed to hook prctl: %d\n", ret);
+        wxshadow_begin_unload("init-rollback-prctl");
         /* Cleanup based on hook method */
         if (hook_method == WX_HOOK_METHOD_DIRECT) {
-            hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
-            hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
+            mkpm_unwrap_for_exit(kfunc_single_step_handler, single_step_handler_before, NULL);
+            mkpm_unwrap_for_exit(kfunc_brk_handler, brk_handler_before, NULL);
         } else if (hook_method == WX_HOOK_METHOD_REGISTER) {
             wx_unregister_brk_step_hooks();
         }
@@ -1476,12 +1509,13 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
     if (ret != HOOK_NO_ERR) {
         pr_err("wxshadow: failed to hook exit_mmap: %d\n", ret);
         pr_err("wxshadow: refusing to load without exit_mmap cleanup\n");
+        wxshadow_begin_unload("init-rollback-exit_mmap");
         if (kfunc_do_page_fault)
-            hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
-        unhook_syscalln(__NR_prctl, prctl_before, NULL);
+            mkpm_unwrap_for_exit(kfunc_do_page_fault, do_page_fault_before, NULL);
+        mkpm_unhook_syscall_for_exit(__NR_prctl, prctl_before, NULL);
         if (hook_method == WX_HOOK_METHOD_DIRECT) {
-            hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
-            hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
+            mkpm_unwrap_for_exit(kfunc_single_step_handler, single_step_handler_before, NULL);
+            mkpm_unwrap_for_exit(kfunc_brk_handler, brk_handler_before, NULL);
         } else if (hook_method == WX_HOOK_METHOD_REGISTER) {
             wx_unregister_brk_step_hooks();
         }
@@ -1558,7 +1592,7 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
 /*
  * wait_for_handlers_drain - spin until all in-flight handlers complete.
  *
- * Called after unhooking each set of handlers.  Because KP calls
+ * Called after detaching each set of handlers.  Because KP calls
  * kp_free_exec(mod->start) immediately after exit() returns, we MUST
  * ensure no module code is executing before we return.
  *
@@ -1606,13 +1640,17 @@ static long wxshadow_exit(void *__user reserved)
 
     pr_info("wxshadow: unloading...\n");
 
+    /* 先关业务入口，再等已经进入模块的 fault/BRK/step/fork 回调退出。
+     * 这样 page_list 清理阶段不会再接纳新的业务操作。 */
+    wxshadow_begin_unload("pre-unload-gate");
+
     /*
      * Phase 1: Unhook prctl to block new user operations.
      * BRK/step/fault/exit_mmap hooks remain active throughout Phase 2
      * to handle any in-flight operations while pages are being cleaned.
      */
-    unhook_syscalln(__NR_prctl, prctl_before, NULL);
-    pr_info("wxshadow: unhooked prctl (phase 1)\n");
+    mkpm_unhook_syscall_for_exit(__NR_prctl, prctl_before, NULL);
+    pr_info("wxshadow: detached prctl callback (phase 1; trampoline retained)\n");
     wait_for_handlers_drain("phase1-prctl");
 
     /*
@@ -1631,15 +1669,15 @@ static long wxshadow_exit(void *__user reserved)
      * shadow pages, but page_list is already empty so it will be a no-op.
      */
     if (kfunc_dup_mmap) {
-        hook_unwrap(kfunc_dup_mmap, before_dup_mmap_wx, after_dup_mmap_wx);
-        pr_info("wxshadow: unhooked dup_mmap (phase 2.5)\n");
+        mkpm_unwrap_for_exit(kfunc_dup_mmap, before_dup_mmap_wx, after_dup_mmap_wx);
+        pr_info("wxshadow: detached dup_mmap callback (phase 2.5; trampoline retained)\n");
         wait_for_handlers_drain("phase2.5-dup_mmap");
     }
     if (kfunc_uprobe_dup_mmap) {
-        hook_unwrap(kfunc_uprobe_dup_mmap,
-                    before_uprobe_dup_mmap_wx,
-                    after_uprobe_dup_mmap_wx);
-        pr_info("wxshadow: unhooked uprobe_dup_mmap (phase 2.5)\n");
+        mkpm_unwrap_for_exit(kfunc_uprobe_dup_mmap,
+                             before_uprobe_dup_mmap_wx,
+                             after_uprobe_dup_mmap_wx);
+        pr_info("wxshadow: detached uprobe_dup_mmap callback (phase 2.5; trampoline retained)\n");
         wait_for_handlers_drain("phase2.5-uprobe_dup_mmap");
     }
 
@@ -1652,9 +1690,9 @@ static long wxshadow_exit(void *__user reserved)
      * wait_for_handlers_drain() handles this via the wx_in_flight counter.
      */
     if (hook_method == WX_HOOK_METHOD_DIRECT) {
-        hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
-        hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
-        pr_info("wxshadow: unhooked brk/step handlers (direct, phase 3)\n");
+        mkpm_unwrap_for_exit(kfunc_single_step_handler, single_step_handler_before, NULL);
+        mkpm_unwrap_for_exit(kfunc_brk_handler, brk_handler_before, NULL);
+        pr_info("wxshadow: detached brk/step callbacks (direct, phase 3)\n");
 
         /* Wait for any in-flight direct-hook handler to complete */
         wait_for_handlers_drain("phase3-direct");
@@ -1678,8 +1716,8 @@ static long wxshadow_exit(void *__user reserved)
      * page_list is empty; fault handler will find no pages to process.
      */
     if (kfunc_do_page_fault) {
-        hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
-        pr_info("wxshadow: unhooked do_page_fault (phase 4)\n");
+        mkpm_unwrap_for_exit(kfunc_do_page_fault, do_page_fault_before, NULL);
+        pr_info("wxshadow: detached do_page_fault callback (phase 4; trampoline retained)\n");
         wait_for_handlers_drain("phase4-fault");
     }
 
@@ -1688,9 +1726,9 @@ static long wxshadow_exit(void *__user reserved)
      * page_list is empty; handler will find no overlapping pages.
      */
     if (kfunc_follow_page_pte) {
-        hook_unwrap(kfunc_follow_page_pte, follow_page_pte_before,
-                    follow_page_pte_after);
-        pr_info("wxshadow: unhooked follow_page_pte (phase 4.5)\n");
+        mkpm_unwrap_for_exit(kfunc_follow_page_pte, follow_page_pte_before,
+                             follow_page_pte_after);
+        pr_info("wxshadow: detached follow_page_pte callback (phase 4.5; trampoline retained)\n");
         wait_for_handlers_drain("phase4.5-follow_page_pte");
     }
 
@@ -1700,8 +1738,8 @@ static long wxshadow_exit(void *__user reserved)
      * Safe to remove now that page_list is empty.
      */
     if (kfunc_exit_mmap) {
-        hook_unwrap(kfunc_exit_mmap, exit_mmap_before, NULL);
-        pr_info("wxshadow: unhooked exit_mmap (phase 5)\n");
+        mkpm_unwrap_for_exit(kfunc_exit_mmap, exit_mmap_before, NULL);
+        pr_info("wxshadow: detached exit_mmap callback (phase 5; trampoline retained)\n");
         wait_for_handlers_drain("phase5-exit_mmap");
     }
 
@@ -1715,8 +1753,26 @@ long wxshadow_control(const char *args, char *__user out_msg, int outlen)
 static long wxshadow_control(const char *args, char *__user out_msg, int outlen)
 #endif
 {
-    pr_info("wxshadow: control called with args: %s\n", args ? args : "(null)");
-    return 0;
+    char msg[96];
+    int n;
+
+    if (args && !strncmp(args, "enable", 6)) {
+        wxs_enabled = 1;
+        pr_info("wxshadow: control-plane ENABLED via ctl0\n");
+    } else if (args && !strncmp(args, "disable", 7)) {
+        wxs_enabled = 0;
+        pr_info("wxshadow: control-plane DISABLED via ctl0\n");
+    }
+    /* "status" and anything else just reports */
+
+    n = snprintf(msg, sizeof(msg),
+                 "wxshadow: enabled=%d (prctl gate; existing shadow pages stay handled)\n",
+                 wxs_enabled);
+    if (!out_msg || outlen <= 0)
+        return 0;
+    if (n + 1 > outlen)
+        n = outlen - 1;
+    return compat_copy_to_user(out_msg, msg, n + 1);
 }
 
 #ifndef MKPM_MERGED

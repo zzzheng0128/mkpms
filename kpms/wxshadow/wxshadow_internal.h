@@ -25,6 +25,7 @@
 #include <asm/ptrace.h>
 #include <asm/atomic.h>
 #include <linux/err.h>
+#include "hook_lifecycle.h"
 
 #include <predata.h>
 #include "wxshadow.h"
@@ -531,7 +532,9 @@ int wxshadow_restore_shadow_ranges(struct wxshadow_page *page);
 u64 *get_user_pte(void *mm, unsigned long addr, void **ptlp);
 int wxshadow_try_split_pmd(void *mm, void *vma, unsigned long addr);
 void pte_unmap_unlock(u64 *pte, void *ptl);
-void wxshadow_flush_tlb_page(void *vma, unsigned long uaddr);
+/* Flush the target address.  `mm` is passed separately because a VMA offset
+ * probe may be stale on a newer kernel; the page owner is authoritative. */
+void wxshadow_flush_tlb_page(void *mm, void *vma, unsigned long uaddr);
 u64 make_pte(unsigned long pfn, u64 prot);
 int wxshadow_page_activate_shadow(struct wxshadow_page *page, void *vma,
                                   unsigned long addr);
@@ -589,6 +592,18 @@ int wxshadow_do_del_bp(void *mm, unsigned long addr);
 int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned long len);
 int wxshadow_do_release(void *mm, unsigned long addr);
 void prctl_before(hook_fargs4_t *args, void *udata);
+
+/*
+ * Global control-plane switch (ctl0 "wxshadow enable|disable|status").
+ * When 0, prctl_before passes ALL PR_WXSHADOW_* options through to the
+ * kernel untouched (caller gets the stock EINVAL, so the module is
+ * undetectable via prctl probing). Existing shadow pages keep being
+ * handled by the fault path, so disabling never strands a patched page.
+ */
+extern volatile int wxs_enabled;
+/* exit() 置 1 后，所有新进入的业务回调只做快速返回；已有回调仍由
+ * wx_in_flight 计数保护，避免清理 page_list 时并发修改。 */
+extern volatile int wxs_unloading;
 
 /* ========== Scan functions (wxshadow_scan.c) ========== */
 

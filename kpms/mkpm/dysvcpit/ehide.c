@@ -18,6 +18,28 @@
 #include "opts.h"
 #include "ehide.h"
 
+/* =====================================================================
+ * ehide.c - per-uid readdir 入口隐藏实现
+ * =====================================================================
+ *
+ * 【核心思路】
+ *   - 维护一个 rule list, 每个 rule: {prefix | exact | tid} + path
+ *   - 规则挂在 uid 下, 每个 uid 一个链表头
+ *   - 控制器通过 ctl0 ("ehide <uid> addprefix|addexact|addtid ...") 加 / 删
+ *   - before-hook (faccessat 系): 命中 -> 强制 -ENOENT
+ *   - after-hook (getdents64): 命中 -> 过滤掉目录条目 (类似 antidetect)
+ *
+ * 【并发】
+ *   - 读路径 (syscall 上下文): RCU 读锁保护 list 遍历
+ *   - 写路径 (ctl0 上下文): spin_lock + 改 list, 最后 synchronize_rcu
+ *     再释放被替换的 node (call_rcu)
+ *
+ * 【依赖】
+ *   - global.h 提供 ASHMEM_PREFIX 等常量和全局变量
+ *   - opts.h 提供 getopt 解析
+ *   - 懒加载: 由 mkpm_call_dys 在首次 ctl0 "ehide ..." 时调 ehide_init
+ */
+
 #define __GFP_DIRECT_RECLAIM 0x400u
 #define __GFP_KSWAPD_RECLAIM 0x800u
 #define __GFP_ATOMIC 0x200u

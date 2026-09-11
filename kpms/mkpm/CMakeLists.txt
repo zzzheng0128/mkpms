@@ -15,6 +15,7 @@ add_kpm_module(mkpm
     dysvcpit/eredirect.c
     dysvcpit/evm.c
     dysvcpit/emaps.c
+    dysvcpit/boottime.c
     antidetect/antidetect.c
     antidetect/supercall.c
 )

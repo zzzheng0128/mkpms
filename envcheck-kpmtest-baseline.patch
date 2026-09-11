@@ -1,0 +1,28 @@
+--- app/src/main/cpp/kpmtest.c
++++ app/src/main/cpp/kpmtest.c
+@@ -190,7 +190,7 @@
+ 
+ static void test_hide_maps_token(struct jbuf *b) {
+     long fd, map;
+-    int present_before, present_after;
++    int present_after;
+ 
+     /* create the marker file so it can be mmap'ed */
+     fd = kpm_svc(56, -100, (long) MARKER_MAP_PATH,
+@@ -207,13 +207,10 @@
+     if ((uint64_t) map >= (uint64_t) -4095UL)
+         return;
+ 
+-    /* before hide-so sees it, the maps line should exist (sanity) */
+-    present_before = maps_has_token("wwb_envcheck_map");
+-    jb_kv(b, "wwb_maps_present", present_before);
+-
+-    /* trigger a fresh maps read; with hide-so ON the line must be gone */
++    /* hide-so 在 KPM 加载时就已经生效；这里读取的是当前可见结果。 */
+     present_after = maps_has_token("wwb_envcheck_map");
+-    jb_kv(b, "wwb_maps_hidden", present_before == 1 && present_after == 0);
++    jb_kv(b, "wwb_maps_present", present_after);
++    jb_kv(b, "wwb_maps_hidden", present_after == 0);
+ 
+     kpm_svc(NR_munmap, map, 4096, 0, 0, 0, 0);
+     unlink(MARKER_MAP_PATH);

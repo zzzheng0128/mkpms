@@ -1,3 +1,25 @@
+/* =====================================================================
+ * opts.c - ctl0 命令行解析 (dysvcpit 内部使用)
+ * =====================================================================
+ *
+ * getopt(input) 流程:
+ *   1. 用 strnlen(input, OPTS_MAX_IN-1) 限长, 防恶意大输入爆 kmalloc
+ *   2. kallsyms 解析 __kmalloc/kfree/memset/memcpy/strlen — 每次都解析
+ *      (KP loader 不暴露符号, 不能用 kfunc)
+ *   3. kmalloc 两块: sizeof(struct opts) + input 副本
+ *   4. 把 input 副本写进 _copy
+ *   5. 顺序扫描 token:
+ *      - 跳过前导空白
+ *      - 遇到 "..." 整段作为 token, 去掉引号, 内部 \X 反斜杠转义
+ *      - 否则按空白分隔
+ *      - 每个 token 写进 result->args[idx++]
+ *   6. size = 最终 token 数
+ *
+ * free_opts 释放 struct + _copy。
+ *
+ * 注意: 因为 _copy 是 kmalloc 出来的连续 buffer, token 指针都指向它的
+ * 中间某个位置, 不能单独 free, 必须一起。
+ */
 #include "opts.h"
 
 #include <stddef.h>

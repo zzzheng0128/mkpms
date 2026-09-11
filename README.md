@@ -1,4 +1,17 @@
-# android 无痕probe 无痕hook kpm demo
+# mkpms：KernelPatch/APatch KPM 实验模块
+
+> 新手入口：先看 [DEMO_GUIDE.md](DEMO_GUIDE.md)。里面按 CRC32、openat 返回替换、
+> hide 审计和合并模块列出了源码位置、构建路径和 `kpctl` 命令。
+
+本目录用于自有 Pixel/开发机上的 KPM 可用性验证。推荐先构建无副作用的 CRC32 demo，
+再验证限定 UID 和测试路径的 openat 返回替换，最后对现有 `mkpm.kpm` 做 hide、
+sysmon、wxshadow 或 eredirect 的单项对照。
+
+当前合并分支只把 `mkpm` 作为生产入口；`hide-maps` 和 `wxshadow` 是它引用的源码，
+不是独立加载入口。构建约定、Pixel 6 的 `-ffixed-x18` 和产物检查命令写在
+[`kpms/mkpm/README.md`](kpms/mkpm/README.md)。
+
+## 原有 wxshadow 说明
 利用kpm模块实现kernel中动态切换内存分页，实现应用对内存的读和执行分离，读和执行发生在不同的物理页，使应用读到的是原始物理页，执行的是被hook过的物理页，**从而隐藏hook产生的内存修改**
 
 缺陷：无法对自读代码区域设置断点，同一页无法同时读取和执行

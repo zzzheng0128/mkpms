@@ -18,6 +18,7 @@
 #include <kallsyms.h>
 #include <asm/current.h>
 #include <uapi/asm-generic/errno.h>
+#include "../compat/hook_lifecycle.h"
 #include "../../common/kpm_demo_helpers.h"
 
 #ifndef MKPM_MERGED
@@ -31,9 +32,14 @@ KPM_MODULE_INFO("anti-detect",
 /* supercall.c */
 extern int supercall_guard_init(const char *superkey);
 extern void supercall_guard_exit(void);
+extern void supercall_guard_unload(void);
 extern int supercall_guard_is_on(void);
 
 #define AID_APP_START 10000
+/* Effective minimum uid for anti-detect to engage. Settable via
+ * 'antidetect uid-min <N>' for testing (shell uid=2000). Default stays
+ * at the kernel AID_APP_START. */
+static uid_t ad_uid_min = AID_APP_START;
 #define FILENAME_BUF_SIZE 256
 
 #ifndef __NR_faccessat2
@@ -67,12 +73,21 @@ static int hidden_name_count;
 
 static void ad_reset_names(void)
 {
+    /* Defaults aligned with current rustFrida markers (disguised as Android
+     * system resources). Add more via 'antidetect name add <substr>'. */
+    static const char *const defaults[] = {
+        "dalvik-jit-code-cache",
+        "qbdi_helper",
+        NULL,
+    };
     hidden_name_count = 0;
-    hidden_names[0] = 0;
-    kf_memcpy(ad_name_storage[0], "goldfish_", 10);
-    hidden_names[0] = ad_name_storage[0];
-    hidden_name_count = 1;
-    hidden_names[1] = 0;
+    for (int i = 0; defaults[i] && i < AD_MAX_NAMES; i++) {
+        size_t len = kf_strlen(defaults[i]);
+        kf_memcpy(ad_name_storage[i], defaults[i], len + 1);
+        hidden_names[i] = ad_name_storage[i];
+        hidden_name_count++;
+    }
+    hidden_names[hidden_name_count] = 0;
 }
 
 static int ad_add_name(const char *name)
@@ -133,7 +148,7 @@ static void before_stat_syscall(hook_fargs4_t *args, void *udata)
     if (!ad_enabled || !hidden_name_count)
         return;
     uid = current_uid();
-    if (uid < AID_APP_START) return;
+    if (uid < ad_uid_min) return;
 
     const char __user *ufilename = (const char __user *)syscall_argn(args, 1);
     char buf[FILENAME_BUF_SIZE];
@@ -178,7 +193,7 @@ static void after_getdents64(hook_fargs4_t *args, void *udata)
     if (!ad_enabled || !hidden_name_count)
         return;
     uid = current_uid();
-    if (uid < AID_APP_START) return;
+    if (uid < ad_uid_min) return;
 
     ret = (long)args->ret;
     if (ret <= 0) return;
@@ -316,11 +331,11 @@ static long anti_detect_init(const char *args, const char *event, void *__user r
     return 0;
 
 rollback_supercall:
-    supercall_guard_exit();
+    supercall_guard_unload();
 rollback:
     while (hooks_installed-- > 0) {
         const struct syscall_hook *h = &hooks[hooks_installed];
-        unhook_syscalln(h->nr, h->before, h->after);
+        mkpm_unhook_syscall_for_exit(h->nr, h->before, h->after);
     }
     return -1;
 }
@@ -331,11 +346,11 @@ long anti_detect_exit(void *__user reserved)
 static long anti_detect_exit(void *__user reserved)
 #endif
 {
-    supercall_guard_exit();
+    supercall_guard_unload();
     int i;
     for (i = NUM_HOOKS; i-- > 0;) {
         const struct syscall_hook *h = &hooks[i];
-        unhook_syscalln(h->nr, h->before, h->after);
+        mkpm_unhook_syscall_for_exit(h->nr, h->before, h->after);
     }
     pr_info("anti-detect: unloaded\n");
     return 0;
@@ -391,6 +406,16 @@ static size_t ad_tok_copy(char *dst, size_t cap, const char *tok, size_t len)
     return len;
 }
 
+/* ctl0 命令分发表:
+ *   status                打印 enabled / names / uid_min / guard 状态
+ *   enable | disable       总开关
+ *   uid-min <N>           调整 anti-detect 生效的最小 uid (1..100000)
+ *   name list|reset        列出 / 重置 hidden_names
+ *   name add <n>|del <n>   加 / 删一个
+ *   guard on <key>|off    启用 / 关闭 supercall guard, on 时 key 是 superkey
+ *
+ * 入口 args 可能带 "antidetect" 前缀 (从 mkpm.c 转过来) 也可能不带
+ * (单独 KPM 调用), a0/a0 偏移做兼容。 */
 #ifdef MKPM_MERGED
 long antidetect_control0(const char *args, char *__user out_msg, int outlen)
 #else
@@ -413,13 +438,26 @@ static long antidetect_control0(const char *args, char *__user out_msg, int outl
 
     if (argc == 0 || AD_ARG_IS(0, "status")) {
         off += kf_snprintf(msg + off, sizeof(msg) - off,
-                           "anti-detect: enabled=%d names=%d supercall_guard=%d\n",
-                           ad_enabled, hidden_name_count, supercall_guard_is_on());
+                           "anti-detect: enabled=%d names=%d uid_min=%u supercall_guard=%d\n",
+                           ad_enabled, hidden_name_count, ad_uid_min, supercall_guard_is_on());
         for (i = 0; i < hidden_name_count && off < (int)sizeof(msg) - 40; i++)
             off += kf_snprintf(msg + off, sizeof(msg) - off, "name[%d]=%s\n", i, hidden_names[i]);
     } else if (AD_ARG_IS(0, "enable") || AD_ARG_IS(0, "disable")) {
         ad_enabled = AD_ARG_IS(0, "enable");
         off += kf_snprintf(msg + off, sizeof(msg) - off, "ok enabled=%d\n", ad_enabled);
+    } else if (AD_ARG_IS(0, "uid-min") && argc >= 2) {
+        /* parsing: ad_tok_copy lacks strtoul; do it manually */
+        char num[16];
+        AD_ARG_COPY(1, num, sizeof(num));
+        unsigned int v = 0;
+        for (const char *p = num; *p >= '0' && *p <= '9'; p++)
+            v = v * 10 + (unsigned int)(*p - '0');
+        if (v == 0 || v > 100000) {
+            off += kf_snprintf(msg + off, sizeof(msg) - off, "error=bad uid\n");
+        } else {
+            ad_uid_min = (uid_t)v;
+            off += kf_snprintf(msg + off, sizeof(msg) - off, "ok uid_min=%u\n", ad_uid_min);
+        }
     } else if (AD_ARG_IS(0, "name") && argc >= 2) {
         if (AD_ARG_IS(1, "list")) {
             for (i = 0; i < hidden_name_count && off < (int)sizeof(msg) - 40; i++)

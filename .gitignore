@@ -1,4 +1,11 @@
 .idea/
+.DS_Store
+*.swp
+*.bak
 build/
+build-*/
+dist/
+*.kpm
+*.o
 cmake-build-debug/
 tools/kpatch/kpatch

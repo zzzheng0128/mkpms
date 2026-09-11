@@ -57,9 +57,38 @@ static int prepare_shadow_target(void *mm, unsigned long addr,
     void *vma;
     int ret;
 
+    /* The VMA layout changed between the old 4.19 tree and Android 6.1.
+     * scan_vma_struct_offsets() normally finds vm_mm, but module init can run
+     * from a kernel context with no user mm and leave the legacy 0x40 default.
+     * Re-bind the offset against the actual VMA/caller pair before any PTE
+     * switch.  The page object still keeps `mm` as the authoritative owner. */
+    int i;
+    bool vma_mm_matches = false;
+
     vma = kfunc_find_vma(mm, addr);
     if (!vma || vma_start(vma) > addr) {
         pr_err("wxshadow: [%s] no vma for %lx\n", op, addr);
+        return -1;
+    }
+
+    if (vma_vm_mm_offset >= 0 && vma_mm(vma) == mm)
+        vma_mm_matches = true;
+    if (!vma_mm_matches) {
+        for (i = 0x10; i < 0x80; i += 8) {
+            u64 candidate;
+            if (!safe_read_u64((unsigned long)vma + i, &candidate))
+                continue;
+            if (candidate == (u64)mm) {
+                vma_vm_mm_offset = (int16_t)i;
+                vma_mm_matches = true;
+                pr_info("wxshadow: rebound vm_area_struct.vm_mm offset: 0x%x\n", i);
+                break;
+            }
+        }
+    }
+    if (!vma_mm_matches) {
+        pr_err("wxshadow: [%s] vm_area_struct.vm_mm does not match target mm=%px\n",
+               op, mm);
         return -1;
     }
 
@@ -1249,11 +1278,25 @@ void prctl_before(hook_fargs4_t *args, void *udata)
     int ret;
     pid_t pid;
 
+    /* 卸载 gate 置位后不再接纳新的用户控制请求；已进入的调用仍由
+     * WX_HANDLER_ENTER/EXIT 计数保护并在 exit() 前排空。 */
+    if (wxs_unloading)
+        return;
+
     /* Only track wxshadow prctl calls for in-flight counting */
     if (option < PR_WXSHADOW_SET_BP || option > PR_WXSHADOW_RELEASE)
         return;
 
+    /* Global control-plane switch: OFF = pass through to stock kernel
+     * handling (EINVAL), which also makes prctl-based probing fail. */
+    if (!wxs_enabled)
+        return;
+
     WX_HANDLER_ENTER();
+    if (wxs_unloading) {
+        WX_HANDLER_EXIT();
+        return;
+    }
 
     /* Lazy scan mm->context.id offset on first wxshadow prctl call */
     if (mm_context_id_offset < 0)

@@ -1,1 +1,0 @@
-add_kpm_module(syscallhook syscallhook.c)

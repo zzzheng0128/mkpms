@@ -19,9 +19,8 @@ mkpms/
 │   ├── patch/       # 补丁和模块加载
 │   └── linux/       # Linux 内核头文件适配版本
 ├── kpms/            # KPM 模块开发目录
-│   ├── demo-hello/
-│   ├── demo-inlinehook/
-│   ├── demo-syscallhook/
+│   ├── demo-crc32/       # ctl0 CRC32 纯计算 demo
+│   ├── demo-openat-guard/ # 限定 UID+测试路径的 openat 返回替换
 │   ├── hide-maps/   # hide-so v1.2.0 源码 (hidemaps.c, 被 mkpm 链接, 无独立 target)
 │   ├── wxshadow/    # W^X Shadow 断点隐藏 (源码, 被 mkpm 链接)
 │   └── mkpm/        # ★ 唯一 KPM: hide-so + wxshadow + dysvcpit 合并模块
@@ -38,12 +37,16 @@ dysvcpit 各模块 ctl0 首次调用时懒 init。hwbprw/bp/rwmem 未合并 (字
 ## 编译
 
 ```bash
-mkdir build && cd build
-cmake -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc ..
-make                    # 所有模块
-make wxshadow.kpm       # 单个 KPM
-make wxshadow_client    # 用户态客户端
+cmake -S . -B build -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_BUILD_TYPE=Release
+cmake --build build                              # 所有可用 target
+cmake --build build --target mkpm.kpm             # 合并入口
+cmake --build build --target crc32-demo.kpm       # CRC32 独立 demo
+cmake --build build --target openat-guard-demo.kpm # openat 独立 demo
+cmake --build build --target wxshadow_client       # 用户态客户端
 ```
+
+独立 demo 的源码、控制命令和 compat-demo 集成探针见 `DEMO_GUIDE.md`；不要把 `build-*`、
+`dist/`、`.kpm` 和中间 `.o` 文件提交到仓库。
 
 ## KPM 模块开发
 

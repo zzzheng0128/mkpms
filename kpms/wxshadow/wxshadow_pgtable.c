@@ -176,8 +176,8 @@ static inline u64 *pte_offset_kernel_local(void *pmd, unsigned long addr)
  */
 int wxshadow_try_split_pmd(void *mm, void *vma, unsigned long addr)
 {
-    void *pgd, *pud, *pmd;
-    u64 pgd_val, pud_val, pmd_val;
+    void *pgd, *pud = NULL, *pmd;
+    u64 pgd_val, pud_val = 0, pmd_val;
 
     if (!mm || !vma)
         return 0;
@@ -238,6 +238,27 @@ int wxshadow_try_split_pmd(void *mm, void *vma, unsigned long addr)
 /* ========== PTE operations ========== */
 
 /*
+ * Temporary bounded diagnostics for device bring-up.  A failed walk used to
+ * collapse into a single "get_user_pte failed" message, which made it
+ * impossible to tell whether Pixel/GKI rejected the mm->pgd offset, the
+ * descriptor type, or the physical-to-linear mapping.  Keep this bounded so
+ * a bad target cannot flood dmesg during a stress run.
+ */
+static int wxshadow_pte_diag_budget = 24;
+
+static inline void wxshadow_pte_diag(const char *stage, void *mm,
+                                     unsigned long addr, unsigned long ptr,
+                                     u64 value)
+{
+    if (wxshadow_pte_diag_budget <= 0)
+        return;
+    wxshadow_pte_diag_budget--;
+    pr_err("wxshadow: [pte-diag] stage=%s mm=%px addr=%lx ptr=%lx value=%llx level=%d shift=%d pgd_off=0x%x\n",
+           stage, mm, addr, ptr, value, wx_page_level, wx_page_shift,
+           mm_struct_offset.pgd_offset);
+}
+
+/*
  * Get PTE for a user address (lockless)
  *
  * NOTE: We operate without holding page_table_lock. This is safe because:
@@ -253,49 +274,71 @@ u64 *get_user_pte(void *mm, unsigned long addr, void **ptlp)
     u64 pgd_val, pud_val, pmd_val;
 
     pgd = wxshadow_pgd_offset(mm, addr);
-    if (!pgd || !is_kva((unsigned long)pgd))
+    if (!pgd || !is_kva((unsigned long)pgd)) {
+        wxshadow_pte_diag("pgd_ptr", mm, addr, (unsigned long)pgd, 0);
         return NULL;
-    if (!safe_read_u64((unsigned long)pgd, &pgd_val))
+    }
+    if (!safe_read_u64((unsigned long)pgd, &pgd_val)) {
+        wxshadow_pte_diag("pgd_read", mm, addr, (unsigned long)pgd, 0);
         return NULL;
-    if (pgd_val == 0)
+    }
+    if (pgd_val == 0) {
+        wxshadow_pte_diag("pgd_empty", mm, addr, (unsigned long)pgd, pgd_val);
         return NULL;
+    }
 
     if (wx_page_level == 4) {
         /* 4-level page tables: PGD -> PUD -> PMD -> PTE */
         pud = wxshadow_pud_offset(pgd, addr);
-        if (!pud)
+        if (!pud) {
+            wxshadow_pte_diag("pud_ptr", mm, addr, (unsigned long)pgd, pgd_val);
             return NULL;
-        if (!safe_read_u64((unsigned long)pud, &pud_val))
+        }
+        if (!safe_read_u64((unsigned long)pud, &pud_val)) {
+            wxshadow_pte_diag("pud_read", mm, addr, (unsigned long)pud, 0);
             return NULL;
-        if (pud_val == 0)
+        }
+        if (pud_val == 0) {
+            wxshadow_pte_diag("pud_empty", mm, addr, (unsigned long)pud, pud_val);
             return NULL;
+        }
 
         pmd = wxshadow_pmd_offset(pud, addr);
     } else {
         /* 3-level page tables: PGD -> PMD -> PTE (no PUD) */
         pmd = wxshadow_pmd_offset(pgd, addr);
     }
-    if (!pmd)
+    if (!pmd) {
+        wxshadow_pte_diag("pmd_ptr", mm, addr, (unsigned long)pud, pud_val);
         return NULL;
-    if (!safe_read_u64((unsigned long)pmd, &pmd_val))
+    }
+    if (!safe_read_u64((unsigned long)pmd, &pmd_val)) {
+        wxshadow_pte_diag("pmd_read", mm, addr, (unsigned long)pmd, 0);
         return NULL;
-    if (pmd_val == 0)
+    }
+    if (pmd_val == 0) {
+        wxshadow_pte_diag("pmd_empty", mm, addr, (unsigned long)pmd, pmd_val);
         return NULL;
+    }
 
     /* Block mapping: caller should have called wxshadow_try_split_pmd() first */
     if (pmd_sect(pmd_val)) {
+        wxshadow_pte_diag("pmd_block", mm, addr, (unsigned long)pmd, pmd_val);
         pr_warn("wxshadow: addr 0x%lx is PMD block, call wxshadow_try_split_pmd() first\n", addr);
         return NULL;
     }
     if (!pmd_table(pmd_val)) {
+        wxshadow_pte_diag("pmd_type", mm, addr, (unsigned long)pmd, pmd_val);
         pr_warn("wxshadow: invalid PMD type for address 0x%lx: 0x%llx\n", addr, pmd_val);
         return NULL;
     }
 
     /* Get PTE pointer */
     pte = pte_offset_kernel_local(pmd, addr);
-    if (!pte || !is_kva((unsigned long)pte))
+    if (!pte || !is_kva((unsigned long)pte)) {
+        wxshadow_pte_diag("pte_ptr", mm, addr, (unsigned long)pte, pmd_val);
         return NULL;
+    }
 
     /* ptlp is ignored - we operate locklessly */
     if (ptlp)
@@ -420,7 +463,7 @@ static void wxshadow_tlbi_page(void *mm, unsigned long uaddr)
  * 2. kfunc___flush_tlb_range (fallback kernel function)
  * 3. TLBI instruction (final fallback)
  */
-void wxshadow_flush_tlb_page(void *vma, unsigned long uaddr)
+void wxshadow_flush_tlb_page(void *mm, void *vma, unsigned long uaddr)
 {
     if (kfunc_flush_tlb_page) {
         kfunc_flush_tlb_page(vma, uaddr);
@@ -432,7 +475,6 @@ void wxshadow_flush_tlb_page(void *vma, unsigned long uaddr)
         kfunc___flush_tlb_range(vma, uaddr, uaddr + PAGE_SIZE, PAGE_SIZE, true, 3);
     } else {
         /* Final fallback: use TLBI instruction directly */
-        void *mm = vma ? vma_mm(vma) : NULL;
         wxshadow_tlbi_page(mm, uaddr);
     }
 }
@@ -513,7 +555,7 @@ static int wxshadow_write_pte_raw(void *mm, void *vma, unsigned long addr,
 
     wxshadow_set_pte_at_raw(mm, addr, ptep, pte);
     if (flush_tlb)
-        wxshadow_flush_tlb_page(vma, addr);
+        wxshadow_flush_tlb_page(mm, vma, addr);
 
     return 0;
 }
@@ -533,7 +575,10 @@ static int wxshadow_page_switch_mapping_locked(struct wxshadow_page *page,
                                                unsigned long target_pfn,
                                                u64 prot)
 {
-    void *mm = vma_mm(vma);
+    /* page->mm is captured from the syscall caller when the shadow page is
+     * created.  Do not recover it from a guessed vm_area_struct offset here:
+     * Pixel 6/GKI 6.1 moved vm_mm compared with the old 4.19 layout. */
+    void *mm = page ? page->mm : NULL;
     u64 *pte;
     u64 entry;
 
@@ -629,8 +674,8 @@ int wxshadow_page_enter_original(struct wxshadow_page *page, void *vma,
         return -2;
     }
 
-    ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                         get_user_pte(vma_mm(vma), addr, NULL),
+    ret = wxshadow_page_write_pte_locked(page, page->mm, vma, addr,
+                                         get_user_pte(page->mm, addr, NULL),
                                          entry, true);
     if (ret == 0) {
         spin_lock(&global_lock);
@@ -717,8 +762,8 @@ int wxshadow_page_begin_stepping(struct wxshadow_page *page, void *vma,
         return -2;
     }
 
-    ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                         get_user_pte(vma_mm(vma), addr, NULL),
+    ret = wxshadow_page_write_pte_locked(page, page->mm, vma, addr,
+                                         get_user_pte(page->mm, addr, NULL),
                                          entry, true);
     if (ret == 0) {
         wxshadow_flush_icache_page(addr);
@@ -775,8 +820,8 @@ int wxshadow_page_finish_stepping(struct wxshadow_page *page, void *vma,
             return -2;
         }
 
-        ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                             get_user_pte(vma_mm(vma), addr,
+        ret = wxshadow_page_write_pte_locked(page, page->mm, vma, addr,
+                                             get_user_pte(page->mm, addr,
                                                           NULL),
                                              original_entry, true);
         if (ret == 0)
@@ -815,8 +860,8 @@ int wxshadow_page_finish_stepping(struct wxshadow_page *page, void *vma,
             return -2;
         }
 
-        ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                             get_user_pte(vma_mm(vma), addr,
+        ret = wxshadow_page_write_pte_locked(page, page->mm, vma, addr,
+                                             get_user_pte(page->mm, addr,
                                                           NULL),
                                              original_entry, true);
         if (ret == 0)
@@ -872,8 +917,8 @@ int wxshadow_page_enter_dormant_locked(struct wxshadow_page *page, void *vma,
     if (!entry)
         return -1;
 
-    ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                         get_user_pte(vma_mm(vma), addr, NULL),
+    ret = wxshadow_page_write_pte_locked(page, page->mm, vma, addr,
+                                         get_user_pte(page->mm, addr, NULL),
                                          entry, true);
     if (ret == 0) {
         wxshadow_flush_icache_page(addr);
@@ -901,8 +946,8 @@ int wxshadow_page_restore_original_for_teardown_locked(
     if (!entry)
         return -1;
 
-    ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr,
-                                         get_user_pte(vma_mm(vma), addr, NULL),
+    ret = wxshadow_page_write_pte_locked(page, page->mm, vma, addr,
+                                         get_user_pte(page->mm, addr, NULL),
                                          entry, true);
     if (ret == 0)
         wxshadow_flush_icache_page(addr);
@@ -990,7 +1035,7 @@ int wxshadow_page_finish_gup_hide(struct wxshadow_page *page, void *vma,
         goto out_unlock;
     }
 
-    ret = wxshadow_page_write_pte_locked(page, vma_mm(vma), vma, addr, ptep,
+    ret = wxshadow_page_write_pte_locked(page, page->mm, vma, addr, ptep,
                                          orig_pte, true);
 
 out_unlock:

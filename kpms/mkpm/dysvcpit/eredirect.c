@@ -8,6 +8,28 @@
 #include <taskext.h>
 #include <linux/llist.h>
 #include <ktypes.h>
+
+/* =====================================================================
+ * eredirect.c - per-uid open/exec 路径重定向实现
+ * =====================================================================
+ *
+ * 【核心思路】
+ *   - 维护一个 rule list, 每个 rule: {from_path, to_path, uid}
+ *   - 控制器通过 ctl0 ("eredirect <uid> add <from> <to>") 加规则
+ *   - before-hook (openat/openat2): 命中 rule -> 把 path 参数改成 to_path,
+ *     原 syscall 会打开 to 指向的真实文件 (通常是个我们预先准备好的 fake)
+ *   - before-hook (execve): 命中 rule -> 把 filename 改成 to_path
+ *
+ * 【并发】
+ *   与 ehide 一样: RCU 读 + spinlock 写, 老 node 用 call_rcu 延后释放。
+ *
+ * 【典型场景】
+ *   - 反 frida 检测: 把目标对 /proc/<pid>/maps / /proc/<pid>/mem 的访问
+ *     重定向到我们伪造的只读文件, 让目标看到假的内存布局
+ *   - 反 qemu 检测: 把对 /dev/qemu_pipe 等设备路径的访问重定向到 /dev/null
+ *
+ * 【懒加载】 mkpm_call_dys 在首次 ctl0 "eredirect ..." 时调 eredirect_init。
+ */
 #include <linux/kallsyms.h>
 #include <linux/list.h>
 #include <linux/rcupdate.h>
@@ -529,6 +551,41 @@ int eredirect_init(){
     original_do_filp_open = (do_filp_open_func_t)kallsyms_lookup_name("do_filp_open");
     logkd("redirect do_filp_open:%llx", original_do_filp_open);
     return 0;
+}
+
+/*
+ * 读取 redirect 当前状态，供 mkpm 的 ctl0 返回给 kpctl。
+ * eredirect_main() 为历史 ABI，只能返回 int；状态命令需要单独的文本
+ * 快照，避免用户只能看到 "ok=0" 而不知道 hook 是否真的打开。
+ */
+int eredirect_status(char *out, int outlen)
+{
+    int rules = 0;
+    int ranges = 0;
+    struct redir_rule *rule;
+    struct so_range *range;
+
+    if (!out || outlen <= 0 || !kf__scnprintf)
+        return -EINVAL;
+
+    if (kf_spin_lock)
+        kf_spin_lock(&g_redir_lock);
+    list_for_each_entry(rule, &g_redir_rules, list)
+        rules++;
+    if (kf_spin_unlock)
+        kf_spin_unlock(&g_redir_lock);
+
+    if (kf_spin_lock)
+        kf_spin_lock(&g_ranges_lock);
+    list_for_each_entry(range, &g_ranges, list)
+        ranges++;
+    if (kf_spin_unlock)
+        kf_spin_unlock(&g_ranges_lock);
+
+    return kf__scnprintf(out, (size_t)outlen,
+                         "redirect: hooked=%d uid=%d print=%d rules=%d ranges=%d\\n",
+                         hooked ? 1 : 0, r_target_uid, g_print_only ? 1 : 0,
+                         rules, ranges);
 }
 
 // 例如：redirect <uid> addprefix <from> <to> [pc_beg_hex] [pc_end_hex]

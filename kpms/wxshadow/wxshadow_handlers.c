@@ -226,7 +226,13 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
 
 void do_page_fault_before(hook_fargs3_t *args, void *udata)
 {
+    if (wxs_unloading)
+        return;
     WX_HANDLER_ENTER();
+    if (wxs_unloading) {
+        WX_HANDLER_EXIT();
+        return;
+    }
     do_page_fault_before_impl(args, udata);
     WX_HANDLER_EXIT();
 }
@@ -325,14 +331,29 @@ static void follow_page_pte_after_impl(hook_fargs5_t *args, void *udata)
 
 void follow_page_pte_before(hook_fargs5_t *args, void *udata)
 {
+    args->arg5 = 0;
+    if (wxs_unloading)
+        return;
     WX_HANDLER_ENTER();
+    if (wxs_unloading) {
+        WX_HANDLER_EXIT();
+        return;
+    }
     follow_page_pte_before_impl(args, udata);
     WX_HANDLER_EXIT();
 }
 
 void follow_page_pte_after(hook_fargs5_t *args, void *udata)
 {
+    /* before 可能在 gate 置位前已切换 PTE；即使正在卸载，也必须执行
+     * after 侧恢复，否则会把原始 PTE 留在目标进程里。 */
+    if (wxs_unloading && !args->arg5)
+        return;
     WX_HANDLER_ENTER();
+    if (wxs_unloading && !args->arg5) {
+        WX_HANDLER_EXIT();
+        return;
+    }
     follow_page_pte_after_impl(args, udata);
     WX_HANDLER_EXIT();
 }
@@ -369,7 +390,13 @@ static void exit_mmap_before_impl(hook_fargs1_t *args, void *udata)
 
 void exit_mmap_before(hook_fargs1_t *args, void *udata)
 {
+    if (wxs_unloading)
+        return;
     WX_HANDLER_ENTER();
+    if (wxs_unloading) {
+        WX_HANDLER_EXIT();
+        return;
+    }
     exit_mmap_before_impl(args, udata);
     WX_HANDLER_EXIT();
 }
@@ -604,8 +631,14 @@ void before_dup_mmap_wx(hook_fargs2_t *args, void *udata)
 
     (void)udata;
 
-    WX_HANDLER_ENTER();
     args->local.data0 = 0;
+    if (wxs_unloading)
+        return;
+    WX_HANDLER_ENTER();
+    if (wxs_unloading) {
+        WX_HANDLER_EXIT();
+        return;
+    }
     if (!oldmm) {
         WX_HANDLER_EXIT();
         return;
@@ -622,7 +655,13 @@ void after_dup_mmap_wx(hook_fargs2_t *args, void *udata)
 
     (void)udata;
 
+    if (wxs_unloading && !args->local.data0)
+        return;
     WX_HANDLER_ENTER();
+    if (wxs_unloading && !args->local.data0) {
+        WX_HANDLER_EXIT();
+        return;
+    }
     if (!args->local.data0 || !oldmm) {
         WX_HANDLER_EXIT();
         return;
@@ -638,8 +677,14 @@ void before_uprobe_dup_mmap_wx(hook_fargs2_t *args, void *udata)
 
     (void)udata;
 
-    WX_HANDLER_ENTER();
     args->local.data0 = 0;
+    if (wxs_unloading)
+        return;
+    WX_HANDLER_ENTER();
+    if (wxs_unloading) {
+        WX_HANDLER_EXIT();
+        return;
+    }
     if (!oldmm) {
         WX_HANDLER_EXIT();
         return;
@@ -656,7 +701,13 @@ void after_uprobe_dup_mmap_wx(hook_fargs2_t *args, void *udata)
 
     (void)udata;
 
+    if (wxs_unloading && !args->local.data0)
+        return;
     WX_HANDLER_ENTER();
+    if (wxs_unloading && !args->local.data0) {
+        WX_HANDLER_EXIT();
+        return;
+    }
     if (!args->local.data0 || !oldmm) {
         WX_HANDLER_EXIT();
         return;
@@ -673,8 +724,14 @@ void before_copy_process_wx(hook_fargs8_t *args, void *udata)
 
     (void)udata;
 
-    WX_HANDLER_ENTER();
     args->local.data0 = 0;
+    if (wxs_unloading)
+        return;
+    WX_HANDLER_ENTER();
+    if (wxs_unloading) {
+        WX_HANDLER_EXIT();
+        return;
+    }
     if (!wxshadow_copy_process_needs_fork_fix(clone_flags)) {
         WX_HANDLER_EXIT();
         return;
@@ -695,7 +752,13 @@ void after_copy_process_wx(hook_fargs8_t *args, void *udata)
 
     (void)udata;
 
+    if (wxs_unloading && !args->local.data0)
+        return;
     WX_HANDLER_ENTER();
+    if (wxs_unloading && !args->local.data0) {
+        WX_HANDLER_EXIT();
+        return;
+    }
     if (!args->local.data0) {
         WX_HANDLER_EXIT();
         return;
@@ -945,7 +1008,13 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
 int wxshadow_brk_handler(struct pt_regs *regs, unsigned int esr)
 {
     int ret;
+    if (wxs_unloading)
+        return DBG_HOOK_ERROR;
     WX_HANDLER_ENTER();
+    if (wxs_unloading) {
+        WX_HANDLER_EXIT();
+        return DBG_HOOK_ERROR;
+    }
     ret = wxshadow_brk_handler_impl(regs, esr);
     WX_HANDLER_EXIT();
     return ret;
@@ -1056,7 +1125,13 @@ static int wxshadow_step_handler_impl(struct pt_regs *regs, unsigned int esr)
 int wxshadow_step_handler(struct pt_regs *regs, unsigned int esr)
 {
     int ret;
+    if (wxs_unloading)
+        return DBG_HOOK_ERROR;
     WX_HANDLER_ENTER();
+    if (wxs_unloading) {
+        WX_HANDLER_EXIT();
+        return DBG_HOOK_ERROR;
+    }
     ret = wxshadow_step_handler_impl(regs, esr);
     WX_HANDLER_EXIT();
     return ret;
@@ -1076,6 +1151,9 @@ void brk_handler_before(hook_fargs3_t *args, void *udata)
     struct pt_regs *regs = (struct pt_regs *)args->arg2;
     u16 imm;
     int ret;
+
+    if (wxs_unloading)
+        return;
 
     imm = ESR_ELx_ISS_LOCAL(esr) & BRK_COMMENT_MASK;
 
@@ -1100,6 +1178,9 @@ void single_step_handler_before(hook_fargs3_t *args, void *udata)
     unsigned int esr = (unsigned int)args->arg1;
     struct pt_regs *regs = (struct pt_regs *)args->arg2;
     int ret;
+
+    if (wxs_unloading)
+        return;
 
     if (!user_mode(regs))
         return;

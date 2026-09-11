@@ -1,1 +1,0 @@
-add_kpm_module(hello hello.c)

@@ -6,6 +6,36 @@
  * pr_info() output for dmesg-oriented sessions after narrowing the filter.
  */
 
+/* =====================================================================
+ * sysmon.c - 轻量级 syscall 录制器
+ * =====================================================================
+ *
+ * 【数据通路】
+ *   用户进程 syscall -> sysmon_before (before hook)
+ *                   -> 通过过滤器 (uid/tgid/enabled) 则 data0 标记 SYSMON_ACTIVE_MARKER,
+ *                      把 6 个参数存到 hook_fargs6_t 的 local.data[1..6]
+ *                   -> syscall 实际执行
+ *                   -> sysmon_after (after hook)
+ *                   -> 检查 data0 == MARKER, 从 local.data 取回 args,
+ *                      调 sysmon_record 写到 g_ring[]
+ *
+ * 【关键约束 / 踩过的坑】
+ *   - GKI 内核 (Pixel 6) 上 CONFIG_SHADOW_CALL_STACK 强制把 x18 当 SCS 指针,
+ *     GCC 寄存器压力大的函数会踩 x18。编译时必须加 -ffixed-x18 (在
+ *     kpms/mkpm/CMakeLists.txt 的 add_kpm_module 里加), 否则 sysmon_after
+ *     触发 SP/PC alignment exception -> 内核 panic。
+ *   - reply_copy() 永远不能越过 outlen 写用户缓冲区, 否则会爆栈 / 写到
+ *     其他进程内存。
+ *   - sysmon_task_pid/tgid 用 task_struct 直接偏移读 pid, 避开
+ *     __task_pid_nr_ns (后者在不同内核版本签名/实现差异大)。
+ *   - g_next_seq 用 __ATOMIC_RELAXED 自增避免 _raw_spin_lock_irqsave 开销。
+ *
+ * 【并发模型】
+ *   单生产者 (sysmon_after 在 syscall 上下文执行) + 单消费者 (ctl0 read).
+ *   环形索引 seq % SYSMON_RING_CAP, 靠 seq 自增天然防 ABA。
+ *   dropped 计数维护在 seq 超出 SYSMON_RING_CAP 时累加。
+ */
+
 #include <compiler.h>
 #include <kpmodule.h>
 #include <kputils.h>
@@ -16,6 +46,7 @@
 #include <uapi/asm-generic/errno.h>
 #include <uapi/asm-generic/unistd.h>
 #include <asm/current.h>
+#include "../compat/hook_lifecycle.h"
 
 #include "opts.h"
 #include "sysmon.h"
@@ -51,6 +82,9 @@ struct sysmon_reply {
     int len;
 };
 
+/* 全局状态: ring buffer, hook 表, 自增 seq, 各种开关。
+ * volatile 是必须的: 这些变量会在 syscall 上下文 (sysmon_before/after)
+ * 和 ctl0 上下文 (sysmon_main) 之间读写, 不能被编译器优化掉。 */
 static struct sysmon_event g_ring[SYSMON_RING_CAP];
 static struct sysmon_hook g_hooks[SYSMON_MAX_HOOKS];
 static u64 g_next_seq;
@@ -224,6 +258,9 @@ static void sysmon_copy_comm(char dst[SYSMON_COMM_LEN], const char *src)
     dst[i] = '\0';
 }
 
+/* openat/openat2 时把第一个 path 参数从用户态拷过来 (截断到 SYSMON_PATH_MAX),
+ * 控制字符 (空格 / < 0x20 / 0x7f) 用 '?' 替换, 避免污染 log。
+ * 其他 syscall 直接返回, 不读 path。 */
 static void sysmon_capture_path(struct sysmon_event *event)
 {
     const char __user *user_path;
@@ -252,6 +289,8 @@ static void sysmon_capture_path(struct sysmon_event *event)
     }
 }
 
+/* 可选 dmesg 输出, 默认关闭 (打 dmesg 会让 perf 受影响)。
+ * 控制器只在已经收窄过滤器之后才打开, 否则会瞬间刷屏。 */
 static void sysmon_emit_dmesg(const struct sysmon_event *event)
 {
     if (!g_emit_dmesg)
@@ -259,7 +298,7 @@ static void sysmon_emit_dmesg(const struct sysmon_event *event)
 
     pr_info("dysvcpit-syscall seq=%llu nr=%u tid=%u tgid=%u uid=%u ret=%lld comm=%s a0=%llx a1=%llx a2=%llx a3=%llx a4=%llx a5=%llx path=%s\n",
             (unsigned long long)event->seq, event->nr, event->tid,
-            event->tgid, event->uid, (long long)event->ret, event->comm,
+            (unsigned long long)event->tgid, event->uid, (long long)event->ret, event->comm,
             (unsigned long long)event->args[0],
             (unsigned long long)event->args[1],
             (unsigned long long)event->args[2],
@@ -269,6 +308,8 @@ static void sysmon_emit_dmesg(const struct sysmon_event *event)
             event->path[0] ? event->path : "-");
 }
 
+/* 把一条 syscall 写到 g_ring。seq 自增, 超过 RING_CAP 计数到 g_dropped。
+ * 这里必须在 syscall 上下文里足够快, 所以用 __ATOMIC_RELAXED 不用锁。 */
 static void sysmon_record(int nr, const u64 args[6], s64 ret)
 {
     struct sysmon_event event;
@@ -297,6 +338,8 @@ static void sysmon_record(int nr, const u64 args[6], s64 ret)
     sysmon_emit_dmesg(&event);
 }
 
+/* before-hook: 如果过滤器不命中, data0 = 0 (after-hook 看到会直接 return),
+ * 否则 data0 = SYSMON_ACTIVE_MARKER, 6 个参数存到 local.data[1..6]。 */
 static void sysmon_before(hook_fargs6_t *args, void *udata)
 {
     int i;
@@ -311,6 +354,8 @@ static void sysmon_before(hook_fargs6_t *args, void *udata)
         args->local.data[i + 1] = syscall_argn(args, i);
 }
 
+/* after-hook: 看到 MARKER 才把 (args, ret) 投到 g_ring。
+ * 关键: 这里用 udata 指向具体 hook 结构, 拿到 nr 用于 record。 */
 static void sysmon_after(hook_fargs6_t *args, void *udata)
 {
     struct sysmon_hook *hook = (struct sysmon_hook *)udata;
@@ -324,6 +369,7 @@ static void sysmon_after(hook_fargs6_t *args, void *udata)
     sysmon_record(hook->nr, saved_args, (s64)args->ret);
 }
 
+/* 在 g_hooks[] 里按 syscall 号找已挂载的 slot, 没找到返回 -1。 */
 static int sysmon_find_hook(int nr)
 {
     int i;
@@ -335,6 +381,7 @@ static int sysmon_find_hook(int nr)
     return -1;
 }
 
+/* 找一个空的 slot, -1 = 表满。 */
 static int sysmon_find_free_hook(void)
 {
     int i;
@@ -346,6 +393,8 @@ static int sysmon_find_free_hook(void)
     return -1;
 }
 
+/* attach 一个 syscall 号, narg 是参数个数 (KP hook_syscalln 要求)。
+ * 重复 attach 报 -EEXIST, 超过 16 个报 -ENOSPC。 */
 static int sysmon_attach(int nr, int narg)
 {
     int slot;
@@ -368,6 +417,8 @@ static int sysmon_attach(int nr, int narg)
     return 0;
 }
 
+/* detach 一个 syscall 号, 同时把 g_enabled 清零
+ * (避免 detach 之后有残留事件继续打 dmesg)。 */
 static int sysmon_detach(int nr)
 {
     int slot = sysmon_find_hook(nr);
@@ -380,6 +431,7 @@ static int sysmon_detach(int nr)
     return 0;
 }
 
+/* detach 全部 hook, 模块卸载时也走这里。 */
 static void sysmon_detach_all(void)
 {
     int i;
@@ -393,6 +445,7 @@ static void sysmon_detach_all(void)
     }
 }
 
+/* 清空 ring buffer + 重置 seq 和 dropped。 */
 static void sysmon_clear_events(void)
 {
     g_next_seq = 1;
@@ -401,6 +454,8 @@ static void sysmon_clear_events(void)
         g_ring[i].seq = 0;
 }
 
+/* "preset io" 命令: 一键挂上 openat/openat2/read/write/connect/sendto/recvfrom,
+ * 足够覆盖大部分 IO 调试场景。失败保留第一个错误码, 后续继续挂。 */
 static int sysmon_attach_preset_io(void)
 {
     static const struct {
@@ -695,9 +750,28 @@ int sysmon_init(void)
     return 0;
 }
 
+/* 模块卸载时调用: 关 dmesg, detach 所有 hook, 清 ring。 */
 void sysmon_exit(void)
 {
     g_emit_dmesg = 0;
     sysmon_detach_all();
+    sysmon_clear_events();
+}
+
+/* 总 KPM 卸载专用。普通 ctl detach 仍会真正收缩链；这里只有在
+ * KPM 即将释放自身代码时，才保留空的 KernelPatch syscall 跳板。 */
+void sysmon_unload(void)
+{
+    int i;
+
+    g_emit_dmesg = 0;
+    g_enabled = 0;
+    for (i = 0; i < SYSMON_MAX_HOOKS; ++i) {
+        if (!g_hooks[i].attached)
+            continue;
+        mkpm_unhook_syscall_for_exit(g_hooks[i].nr,
+                                     sysmon_before, sysmon_after);
+        g_hooks[i].attached = false;
+    }
     sysmon_clear_events();
 }

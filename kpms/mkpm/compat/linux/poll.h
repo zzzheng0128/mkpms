@@ -1,4 +1,7 @@
 #ifndef _LINUX_POLL_H
+/* compat shim: KP header set 缺 poll_table_struct 类型,
+ * 一些内核头通过这个头间接引用。dysvcpit 没直接用 poll, 但保留以
+ * 防依赖链断。 */
 #define _LINUX_POLL_H
 
 #include <linux/wait.h>

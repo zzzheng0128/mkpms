@@ -1,4 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+/* compat shim: KP header 集缺 build-time 断言宏 (BUILD_BUG_ON / static_assert)。
+ * 内容从上游 Linux 内核复制, 只是为了让依赖这些宏的内核头能编过。
+ * 实际 BUILD_BUG_ON 触发会变 compiletime_assert 错误, KP 已经支持。 */
 #ifndef _LINUX_BUILD_BUG_H
 #define _LINUX_BUILD_BUG_H
 

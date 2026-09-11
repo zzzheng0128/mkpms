@@ -1,5 +1,26 @@
 // evm.c - full file (RCU + list_head pending fput, raw spinlock, no workqueue)
 
+/* =====================================================================
+ * evm.c - per-uid /proc/<pid>/mem 访问控制
+ * =====================================================================
+ *
+ * 【核心思路】
+ *   - 维护一个 rule list: {caller_uid, target_tgid, mode: block|allow|fake}
+ *   - before-hook (process_vm_readv / ptrace / read(mem fd)):
+ *     命中 rule -> 按 mode 决定: block 直接 -EPERM, fake 返回全 0
+ *
+ * 【实现细节】
+ *   - 用 RCU + list_head 保护 rule 链表
+ *   - 待释放的 file 指针挂 pending list, 在 synchronize_rcu 后调 fput
+ *   - 不用 workqueue, 减少攻击面
+ *
+ * 【典型用途】
+ *   - 阻止目标读我们的注入器进程 / frida-agent 的内存布局
+ *   - 给反调试检测返回伪造的 mem, 让它以为我们在调试别的进程
+ *
+ * 【懒加载】 mkpm_call_dys 在首次 ctl0 "evm ..." 时调 evm_init。
+ */
+
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>

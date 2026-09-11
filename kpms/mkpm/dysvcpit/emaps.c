@@ -1,5 +1,31 @@
 // emaps.c  — full version (with <empty> path support)
 
+/* =====================================================================
+ * emaps.c - per-uid /proc/<pid>/maps 行级隐藏 (legacy)
+ * =====================================================================
+ *
+ * 【跟 hide-so 的区别】
+ *   hide-so 在 VMA 层面操作 (proc_maps 路径里的 dentry_name), 改的是
+ *   真实的 vma->vm_file, 影响所有读者; emaps 在 seq_file 渲染层过滤,
+ *   只对特定 uid 看到的 maps 文本生效, 不影响真实 VMA。
+ *
+ * 【保留原因】
+ *   - 老测试 case 的兼容性
+ *   - regex 规则 (hide-so 只支持 token substring 匹配)
+ *   - 多规则叠加 (一个 uid 多条 hide 规则)
+ *
+ * 【实现】
+ *   - 规则存成链表, 每个 rule = {pattern, type: prefix|exact|regex}
+ *   - getdents64 before-hook: 仅当 caller uid == rule uid 时, 给 process
+ *     的 /proc/<pid>/maps 目录条目做掩码 (可选)
+ *   - seq_read after-hook: 把 maps buffer 拷到内核, 按行扫描删掉
+ *     命中规则的行, 再 copy_to_user 回去
+ *
+ * 【懒加载】
+ *   mkpm_call_dys 在首次 ctl0 "emaps ..." 时调 emaps_init, 然后
+ *   emaps_main 处理具体子命令。
+ */
+
 #include <linux/kallsyms.h>
 #include <linux/list.h>
 #include <linux/rcupdate.h>
@@ -53,6 +79,11 @@ struct hook_funcs {
 
 static LIST_HEAD(rule_list);
 static spinlock_t rule_lock;
+/* emaps 由 ctl0 懒加载；hide-so 的 show_map 回调可能更早执行。 */
+static volatile int emaps_ready;
+static volatile int emaps_hooked;
+static volatile int emaps_callback_seen;
+static volatile int emaps_rewrite_seen;
 
 enum maps_rule_flags {
     MAPS_ACT_DROP       = 1 << 0,
@@ -615,19 +646,31 @@ static bool is_uid(void)
     return current_uid() == _target_uid;
 }
 
-static void rep_show_map_vma(struct seq_file *m, struct vm_area_struct *vma){
-    size_t old = m->count;
-    backup_show_map_vma(m, vma);
+/* 对一条已经由 show_map 输出的记录做 emaps 改写。
+ * hide-so 已经稳定 hook 了 show_map；复用它可以覆盖 Pixel 6 上
+ * show_map_vma 不再作为实际 procfs 回调的内核实现。 */
+void emaps_patch_show(struct seq_file *m, size_t old)
+{
+    char *line;
+    size_t newlen;
 
-    if (!is_uid()) return;
-    if (m->count <= old) return;
+    if (!emaps_ready || !emaps_hooked || !m || !m->buf)
+        return;
+    if (!emaps_callback_seen) {
+        emaps_callback_seen = 1;
+        logkd("[CPAG] shared show_map callback active uid=%d", current_uid());
+    }
+    if (!is_uid() || m->count <= old || old >= m->size)
+        return;
 
-    char *line = m->buf + old;
-    size_t linelen = m->count - old;
-
-    size_t newlen = linelen;
+    line = m->buf + old;
+    newlen = m->count - old;
     bool rewrote = patch_one_maps_line(m, line, &newlen);
     if (rewrote){
+        if (!emaps_rewrite_seen) {
+            emaps_rewrite_seen = 1;
+            logkd("[CPAG] first maps rule rewrite uid=%d", current_uid());
+        }
         if (newlen == 0){
             m->count = old; // drop
             return;
@@ -640,9 +683,21 @@ static void rep_show_map_vma(struct seq_file *m, struct vm_area_struct *vma){
     }
 }
 
+static void rep_show_map_vma(struct seq_file *m, struct vm_area_struct *vma){
+    size_t old = m->count;
+    backup_show_map_vma(m, vma);
+    emaps_patch_show(m, old);
+}
+
 static map_show_func_t ori_show_map_vma, backup_show_map_vma;
 
 static bool hook_all(void){
+    /* 某些 6.1 内核只保留 show_map wrapper；此时由 hide-so 的
+     * show_map after 回调调用 emaps_patch_show，不再重复 inline hook。 */
+    if (!ori_show_map_vma) {
+        logkd("[CPAG] show_map_vma unavailable; use shared show_map callback\n");
+        return true;
+    }
     struct hook_funcs hooks[] = {
         {ori_show_map_vma, rep_show_map_vma, (void **)&backup_show_map_vma},
     };
@@ -668,6 +723,7 @@ static inline bool install_hook(void){
         return true;
     }
     if (hook_all()){
+        emaps_hooked = 1;
         logkd("[CPAG] hook installed...");
         return true;
     }
@@ -683,6 +739,7 @@ static inline bool uninstall_hook(void){
     if (ori_show_map_vma){
         unhook(ori_show_map_vma);
     }
+    emaps_hooked = 0;
     hook_err = HOOK_NO_MEM;
     logkd("[CPAG] hook uninstalled...");
     return true;
@@ -691,6 +748,10 @@ static inline bool uninstall_hook(void){
 // ------- 模块入口/命令 -------
 int emaps_init()
 {
+    emaps_ready = 0;
+    emaps_hooked = 0;
+    emaps_callback_seen = 0;
+    emaps_rewrite_seen = 0;
     spin_lock_init(&rule_lock);
 
     kf_rcu_read_lock   = (void *)kallsyms_lookup_name("__rcu_read_lock");
@@ -709,8 +770,9 @@ int emaps_init()
 
     ori_show_map_vma   = (void *)kallsyms_lookup_name("show_map_vma");
     if (!ori_show_map_vma) {
-        logkd("[CPAG] symbol show_map_vma not found");
+        logkd("[CPAG] symbol show_map_vma not found; shared show_map path will be used");
     }
+    emaps_ready = 1;
     return 0;
 }
 
@@ -831,6 +893,8 @@ int emaps_test(struct opts *opts){
 
 void emaps_exit()
 {
+    emaps_ready = 0;
+    emaps_hooked = 0;
     uninstall_hook();
     clear_rules();
     logkd("[CPAG] emap_exit");

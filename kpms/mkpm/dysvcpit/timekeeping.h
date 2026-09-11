@@ -1,5 +1,17 @@
 #pragma once
 
+/* timekeeping.h - KP header 集缺失的内核时间相关 shim
+ *
+ * 几个 dysvcpit 子系统 (eg evm 的 uptime 统计) 需要 ktime_t / timespec64
+ * / KTIME_MAX 等类型和常量, 但 KP header set 没有这些 (KP 想保持精简)。
+ * 这里给最小可用定义。
+ *
+ * 用法: dysvcpit/<module>.c 里 #include "timekeeping.h" 即可。
+ *
+ * 注意: 真实时间精度依赖 ktime_get_real / ktime_get_boottime 等内核函数,
+ * 我们没暴露; 如果以后需要更精确, 把 ktime_get_real 也加进来。
+ */
+
 #include <ktypes.h>
 
 typedef __s64 time64_t;
