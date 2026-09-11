@@ -16,9 +16,11 @@
  * 【核心思路】
  *   - 维护一个 rule list, 每个 rule: {from_path, to_path, uid}
  *   - 控制器通过 ctl0 ("eredirect <uid> add <from> <to>") 加规则
- *   - before-hook (openat/openat2): 命中 rule -> 把 path 参数改成 to_path,
- *     原 syscall 会打开 to 指向的真实文件 (通常是个我们预先准备好的 fake)
- *   - before-hook (execve): 命中 rule -> 把 filename 改成 to_path
+ *   - before-hook (do_filp_open): 仅在完成符号验证后才允许安装；未解析
+ *     完整的内核路径由 redirect_supported 安全熔断。该层覆盖 open/openat/
+ *     openat2 以及直接 svc 进入的文件打开路径。
+ *   - execve 的执行文件路径仍需单独的 exec ABI hook，不能把本规则直接
+ *     当成 execve 重写器使用。
  *
  * 【并发】
  *   与 ehide 一样: RCU 读 + spinlock 写, 老 node 用 call_rcu 延后释放。
@@ -36,6 +38,7 @@
 #include <linux/rculist.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
+#include <kputils.h>
 #include "global.h"
 #include "opts.h"
 #include "eredirect.h"
@@ -123,12 +126,24 @@ static LIST_HEAD(g_ranges);
 static DEFINE_SPINLOCK(g_ranges_lock);
 static bool g_print_only = false; // 纯打印模式
 
-typedef struct file *(*do_filp_open_func_t)(int dfd, struct filename *pathname, const struct open_flags *op);
+/* VFS 层的真实签名（Linux 4.x 到 Android GKI 6.1 均保持这个形状）：
+ *
+ *   do_filp_open(int dfd, struct filename *pathname,
+ *                const struct open_flags *op)
+ *
+ * 这个入口已经完成 getname()，pathname->name 是内核缓冲区；因此重定向
+ * 不需要在 hook 回调里读用户指针，也能覆盖 open/openat/openat2 和直接
+ * svc 进入的路径。
+ */
+typedef struct file *(*do_filp_open_func_t)(int dfd, struct filename *pathname,
+                                             const struct open_flags *op);
 static do_filp_open_func_t original_do_filp_open = NULL;
 static do_filp_open_func_t backup_do_filp_open = NULL;
-static struct file *replace_do_filp_open(int dfd, struct filename *pathname, const struct open_flags *op);
 
 static bool hooked = false;
+/* 能力开关由 eredirect_init() 根据 do_filp_open、getname_kernel、putname
+ * 三个符号共同决定；未解析完整时拒绝安装，避免半初始化 hook。 */
+static bool redirect_supported = false;
 
 int r_target_uid = 0;
 static bool is_uid()
@@ -332,6 +347,27 @@ static bool pc_in_range(u64 pc, u64 beg, u64 end)
     return false;
 }
 
+/* 普通 addexact/addprefix 规则不需要读取 task stack 上的用户现场。只有
+ * 用户明确配置 PC 范围时才需要 PC；这样 P6 的 do_filp_open 路径不会因为
+ * 一个普通路径规则而无条件解引用 _task_pt_reg()。 */
+static bool rules_have_pc_range(void)
+{
+    bool found = false;
+    struct redir_rule *r;
+
+    if (!kf_rcu_read_lock || !kf_rcu_read_unlock)
+        return false;
+    kf_rcu_read_lock();
+    list_for_each_entry_rcu(r, &g_redir_rules, list) {
+        if (r->pc_begin || r->pc_end) {
+            found = true;
+            break;
+        }
+    }
+    kf_rcu_read_unlock();
+    return found;
+}
+
 struct redir_rule_snapshot {
     char to[PATH_MAX];
     u32 flags;
@@ -432,101 +468,67 @@ static u64 io_caller_pc(struct pt_regs *regs, u64 start){
 }
 
 
-// 声明：4.19 上 getname_kernel/putname 都在 <linux/namei.h>
-static struct file *replace_do_filp_open(int dfd, struct filename *pathname, const struct open_flags *op)
+/* do_filp_open 已经拿到内核态 pathname；命中后用 getname_kernel() 生成
+ * 同样类型的临时对象，再调用原始 VFS 函数。这样直接 svc/openat 和
+ * openat2 都会统一经过这里，同时避免修改用户缓冲区。 */
+static struct file *replace_do_filp_open(int dfd, struct filename *pathname,
+                                         const struct open_flags *op)
 {
-    // 先做一次最原始调用条件判断，尽量减小开销
-    if (!is_uid())
-        return backup_do_filp_open(dfd, pathname, op);
-
-    struct task_struct *task = current;
-    struct pt_regs *regs = _task_pt_reg(task);
-    if (!regs)
-        return backup_do_filp_open(dfd, pathname, op);
-
-    // 你原本的“是否在某 so 的执行区间”判断
-    u64 pc = regs->user_regs.pc;
-    // if (!is_in_metasec(pc))
-    //     return backup_do_filp_open(dfd, pathname, op);
-
-    // `pathname->name` 是内核缓冲区里的 NUL 结尾字符串
-    const char *orig = pathname && pathname->name ? pathname->name : NULL;
-    if (!orig || !*orig)
-        return backup_do_filp_open(dfd, pathname, op);
-    if (strstr(orig, "cpag/prop.json") || strstr(orig, "cpag/prop2.json")){
-        return backup_do_filp_open(dfd, pathname, op);
-    }
-
-    // 尝试解析 /proc/<pid>/fd/<n> 真实路径
-    char realbuf[PATH_MAX];
-    const char *path_for_print = orig;
-    if (resolve_if_proc_fd(orig, realbuf, sizeof(realbuf))){
-        path_for_print = realbuf;
-    }    
-
-    struct so_range_snapshot range;
-    bool has_range = range_snapshot_by_pc(pc, &range);
-    const char *so_name = has_range ? range.name : "unknown";
-    u64 offset = has_range ? (pc - range.start) : pc;
-    u64 caller_offset = has_range ? io_caller_pc(regs, range.start) : 0;
-    if (g_print_only){
-        // if (strstr(so_name, "libc.so")){
-        //     return backup_do_filp_open(dfd, pathname, op);
-        // }
-        if (has_range)
-            logkd("[IO] pc=0x%llx so=%s off=0x%llx offup=0x%llx path=%s", pc, so_name, offset, caller_offset,path_for_print);
-        return backup_do_filp_open(dfd, pathname, op);
-    }
-    
-    // 相对路径先不动，避免 dfd/cwd 差异；需要时再扩展
-    if (orig[0] != '/')
-        return backup_do_filp_open(dfd, pathname, op);
-
-    // 查规则
+    const char *orig;
     struct redir_rule_snapshot rule;
-    if (!match_rule_snapshot(orig, pc, &rule))
+    u64 pc = 0;
+    struct filename *replacement;
+    struct file *ret;
+
+    if (!backup_do_filp_open)
+        return ERR_PTR(-ENOSYS);
+    if (!is_uid() || !pathname || !pathname->name)
+        return backup_do_filp_open(dfd, pathname, op);
+    orig = pathname->name;
+    if (!orig[0] || orig[0] != '/' ||
+        strstr(orig, "cpag/prop.json") || strstr(orig, "cpag/prop2.json"))
         return backup_do_filp_open(dfd, pathname, op);
 
-    // 命中规则：构造新的 filename，直接传给备份函数
-    // 注意：不用先打开原路径再 fput，避免多余开销 & 竞态
-    struct filename *newname = kf__getname_kernel(rule.to);
-    if (IS_ERR(newname)) {
-        // 构造失败，回退到原始行为
+    /* 这个安全路径不读取 task pt_regs；带 PC 范围的旧规则暂不应用。 */
+    if (rules_have_pc_range() || !match_rule_snapshot(orig, pc, &rule))
         return backup_do_filp_open(dfd, pathname, op);
-    }
 
-    // 可选：白名单开关（你的 ext->priv_sel_allow）——如果底层有 LSM/selinux 绕行需求
-    set_priv_sel_allow(current, true);
-    struct file *filp = backup_do_filp_open(dfd, newname, op);
-    set_priv_sel_allow(current, false);
+    replacement = kf__getname_kernel(rule.to);
+    if (IS_ERR_OR_NULL(replacement))
+        return backup_do_filp_open(dfd, pathname, op);
 
-    kf__putname(newname);
-
-    // 打印一次日志方便核对
-    if (!IS_ERR(filp)) {
-        logkd("redirect: '%s' => '%s' (pc=0x%llx)", orig, rule.to, pc);
-    } else {
-        logkd("redirect FAIL: '%s' => '%s' (pc=0x%llx, err=%ld)", orig, rule.to, pc, PTR_ERR(filp));
-    }
-    return filp;
+    ret = backup_do_filp_open(dfd, replacement, op);
+    if (IS_ERR_OR_NULL(ret))
+        logkd("redirect FAIL: '%s' => '%s' (err=%ld)", orig, rule.to,
+              PTR_ERR(ret));
+    else
+        logkd("redirect opened: '%s' => '%s'", orig, rule.to);
+    kf__putname(replacement);
+    return ret;
 }
 
 static inline bool hook_do_filp_open(){
-    if (original_do_filp_open){
-        hook_err_t hook_err = hook((void *)original_do_filp_open, (void *)replace_do_filp_open, (void **)&backup_do_filp_open);
-        if (hook_err != HOOK_NO_ERR){
-            hooked = false;
-            logkd("redirect hook do_filp_open, %llx, error: %d", original_do_filp_open, hook_err);
-        }else{
-            hooked = true;
-            return true;
-        }
-    }else{
-        hooked = false;
-        hook_err_t hook_err = HOOK_BAD_ADDRESS;
-        logkd("%s","redirect no symbol: do_filp_open");
+    if (!redirect_supported) {
+        logkd("redirect unsupported: filesystem hook disabled on kernel=%x",
+              kver);
+        return false;
     }
-    return false;
+    if (!original_do_filp_open || !kf__getname_kernel || !kf__putname) {
+        hooked = false;
+        logkd("redirect no safe symbol: do_filp_open/getname_kernel/putname");
+        return false;
+    }
+    hook_err_t hook_err = hook((void *)original_do_filp_open,
+                               (void *)replace_do_filp_open,
+                               (void **)&backup_do_filp_open);
+    if (hook_err != HOOK_NO_ERR) {
+        hooked = false;
+        logkd("redirect hook do_filp_open, error: %d", hook_err);
+        return false;
+    }
+    hooked = true;
+    logkd("redirect hook do_filp_open installed...");
+    return true;
 }
 
 static inline bool install_hook(){
@@ -594,8 +596,15 @@ int eredirect_init(){
     logkd("kf__path_put:%p", kf__path_put);
     logkd("kf__memdup_user:%p", kf__memdup_user);
 
-    original_do_filp_open = (do_filp_open_func_t)kallsyms_lookup_name("do_filp_open");
+    original_do_filp_open = (do_filp_open_func_t)
+        kallsyms_lookup_name("do_filp_open");
+    /* do_filp_open 的参数形状与当前 Pixel6 GKI 源码一致，且替换对象
+     * 已经是内核态 filename；只有三个必要符号都存在时才报告可用。 */
+    redirect_supported = original_do_filp_open != NULL &&
+                         kf__getname_kernel != NULL &&
+                         kf__putname != NULL;
     logkd("redirect do_filp_open:%llx", original_do_filp_open);
+    logkd("redirect supported=%d", redirect_supported ? 1 : 0);
     return 0;
 }
 
@@ -629,8 +638,9 @@ int eredirect_status(char *out, int outlen)
         kf_spin_unlock(&g_ranges_lock);
 
     return kf__scnprintf(out, (size_t)outlen,
-                         "redirect: hooked=%d uid=%d print=%d rules=%d ranges=%d\\n",
-                         hooked ? 1 : 0, r_target_uid, g_print_only ? 1 : 0,
+                         "redirect: supported=%d hooked=%d uid=%d print=%d rules=%d ranges=%d\n",
+                         redirect_supported ? 1 : 0, hooked ? 1 : 0,
+                         r_target_uid, g_print_only ? 1 : 0,
                          rules, ranges);
 }
 
