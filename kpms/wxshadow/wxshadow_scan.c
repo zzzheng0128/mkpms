@@ -103,11 +103,14 @@ int resolve_symbols(void)
     pr_info("wxshadow: [5/12] address translation...\n");
     kvar_memstart_addr = (s64 *)lookup_name_safe("memstart_addr");
     if (!kvar_memstart_addr) {
-        pr_err("wxshadow: memstart_addr not found\n");
-        return -1;
+        /* On kernels without CONFIG_KALLSYMS_ALL (e.g. redfin msm-4.19), data symbols
+         * are not in kallsyms. Don't fail here: the AT instruction detection below
+         * will derive the linear-map offset at runtime. */
+        pr_warn("wxshadow: memstart_addr not found (no KALLSYMS_ALL?), relying on AT detection\n");
+    } else {
+        pr_info("wxshadow: memstart_addr=%px, value=0x%llx\n",
+                kvar_memstart_addr, *kvar_memstart_addr);
     }
-    pr_info("wxshadow: memstart_addr=%px, value=0x%llx\n",
-            kvar_memstart_addr, *kvar_memstart_addr);
 
     kvar_physvirt_offset = (s64 *)lookup_name_safe("physvirt_offset");
     if (kvar_physvirt_offset) {
@@ -170,6 +173,18 @@ int resolve_symbols(void)
         }
     }
 
+    /* Hard check: without any usable linear-map translation mode, phys<->virt
+     * conversions would deref NULL (memstart_addr) — refuse to load instead. */
+    if (!physvirt_offset_valid && !kvar_physvirt_offset && !kvar_memstart_addr) {
+        pr_err("wxshadow: no address translation mode available "
+               "(AT failed, no physvirt_offset, no memstart_addr)\n");
+        return -1;
+    }
+    if (physvirt_offset_valid && !kvar_memstart_addr && !kvar_physvirt_offset) {
+        pr_info("wxshadow: using AT-derived linear-map offset only (0x%llx)\n",
+                detected_physvirt_offset);
+    }
+
     /* ===== Page table operations ===== */
     pr_info("wxshadow: [6/12] page table ops...\n");
 
@@ -209,10 +224,13 @@ int resolve_symbols(void)
     /* init_task - looked up via lookup_name_safe since framework doesn't export it */
     wx_init_task = (struct task_struct *)lookup_name_safe("init_task");
     if (!wx_init_task) {
-        pr_err("wxshadow: init_task not found\n");
-        return -1;
+        /* Data symbol invisible without CONFIG_KALLSYMS_ALL (redfin msm-4.19).
+         * wxshadow_init derives it from pid-1/pid-2 anchors after all
+         * functions are resolved. */
+        pr_warn("wxshadow: init_task not found (no KALLSYMS_ALL?), will derive from anchors\n");
+    } else {
+        pr_info("wxshadow: wx_init_task at %px\n", wx_init_task);
     }
-    pr_info("wxshadow: wx_init_task at %px\n", wx_init_task);
 
     /* TLB flush - try flush_tlb_page first, fallback to __flush_tlb_range, then TLBI */
     kfunc_flush_tlb_page = (typeof(kfunc_flush_tlb_page))
@@ -430,6 +448,211 @@ int resolve_symbols(void)
     return 0;
 }
 
+/* ========== Runtime anchor derivation (kernels without CONFIG_KALLSYMS_ALL) ==========
+ *
+ * On such kernels (e.g. Pixel 5 / redfin msm-4.19) kallsyms contains text
+ * symbols only, so data symbols (init_task / init_mm / memstart_addr) are
+ * invisible. We derive everything from two well-known ANCHOR TASKS instead:
+ *   pid 1  -> comm "init"     (Android init, user process)
+ *   pid 2  -> comm "kthreadd" (kernel thread daemon, leader of all kthreads)
+ */
+
+/* comm offset via dual anchor: both tasks must expose their known comm at the
+ * same offset. Step 1: comm may be only byte-aligned in some layouts. */
+static bool safe_read_str(unsigned long addr, char *buf, size_t maxlen);
+static int derive_comm_offset(struct task_struct *task1, struct task_struct *task2)
+{
+    char c1[16], c2[16];
+    int i;
+
+    for (i = 0; i + 16 <= 0x1800; i++) {
+        if (!safe_read_str((unsigned long)task1 + i, c1, sizeof(c1)))
+            continue;
+        if (c1[0] != 'i' || c1[1] != 'n' || c1[2] != 'i' || c1[3] != 't' || c1[4] != '\0')
+            continue;
+        if (!safe_read_str((unsigned long)task2 + i, c2, sizeof(c2)))
+            continue;
+        if (c2[0] == 'k' && c2[1] == 't' && c2[2] == 'h' && c2[3] == 'r' &&
+            c2[4] == 'e' && c2[5] == 'a' && c2[6] == 'd' && c2[7] == 'd' &&
+            c2[8] == '\0')
+            return i;
+    }
+    return -1;
+}
+
+/* Walk the candidate process list starting from anchor+i; the true tasks list
+ * must lead us to the task with comm "swapper/0" (= init_task, pid 0) and pass
+ * through "kthreadd". All reads are probe-safe. Returns init_task or NULL,
+ * and sets task_struct_offset.tasks_offset on success. */
+static struct task_struct *derive_init_task_via_list(struct task_struct *anchor,
+                                                     int comm_off)
+{
+    int i;
+    char comm[16];
+
+    for (i = 0x80; i < 0x900; i += 8) {
+        u64 next, prev, cur;
+        struct task_struct *found = NULL;
+        int hops = 0, saw_kthreadd = 0;
+        u64 anchor_node = (unsigned long)anchor + i;
+
+        if (!safe_read_u64(anchor_node, &next) || !safe_read_u64(anchor_node + 8, &prev))
+            continue;
+        if (!is_kva(next) || !is_kva(prev) || next == prev)
+            continue;
+        /* next->prev must point back at the anchor node */
+        {
+            u64 next_prev;
+            if (!safe_read_u64(next + 8, &next_prev) || next_prev != anchor_node)
+                continue;
+        }
+
+        cur = next;
+        while (hops++ < 8192) {
+            struct task_struct *t = (struct task_struct *)(cur - i);
+
+            if (!safe_read_str((unsigned long)t + comm_off, comm, sizeof(comm)))
+                break;
+            if (comm[0] == 's' && comm[1] == 'w' && comm[2] == 'a' &&
+                comm[3] == 'p' && comm[4] == 'p' && comm[5] == 'e' &&
+                comm[6] == 'r')
+                found = t; /* "swapper" or "swapper/0" */
+            if (comm[0] == 'k' && comm[1] == 't' && comm[2] == 'h' &&
+                comm[3] == 'r' && comm[4] == 'e' && comm[5] == 'a' &&
+                comm[6] == 'd' && comm[7] == 'd')
+                saw_kthreadd = 1;
+
+            {
+                u64 nn, nnp;
+                if (!safe_read_u64(cur, &nn) || !is_kva(nn))
+                    break;
+                if (nn == anchor_node)
+                    break; /* wrapped back to anchor: full circle */
+                if (!safe_read_u64(nn + 8, &nnp) || nnp != cur)
+                    break; /* list integrity broken: wrong candidate */
+                cur = nn;
+            }
+        }
+
+        if (found && saw_kthreadd) {
+            task_struct_offset.tasks_offset = i;
+            return found;
+        }
+    }
+    return NULL;
+}
+
+/* mm / active_mm offsets via dual user task: for user tasks both fields hold
+ * the same get_task_mm() value and sit 8 bytes apart. Cross-checking two
+ * tasks with different mm's eliminates real_parent/parent style look-alikes. */
+static int derive_mm_offsets(struct task_struct *task1)
+{
+    struct mm_struct *mm_cur, *mm_a;
+    struct task_struct *cur = current;
+    int i, cand = -1;
+
+    if (!kfunc_get_task_mm || !kfunc_mmput || !cur)
+        return -1;
+
+    mm_cur = kfunc_get_task_mm(cur);
+    mm_a = kfunc_get_task_mm(task1);
+    if (!mm_cur || !mm_a)
+        goto out;
+
+    for (i = 0x10; i + 16 <= 0x1800; i += 8) {
+        u64 a, b, c, d;
+
+        if (!safe_read_u64((unsigned long)cur + i, &a) ||
+            !safe_read_u64((unsigned long)cur + i + 8, &b))
+            continue;
+        if (a != (u64)mm_cur || b != (u64)mm_cur)
+            continue;
+
+        if (!safe_read_u64((unsigned long)task1 + i, &c) ||
+            !safe_read_u64((unsigned long)task1 + i + 8, &d))
+            continue;
+        if (c != (u64)mm_a || d != (u64)mm_a)
+            continue;
+
+        if (cand >= 0 && cand != i) {
+            /* more than one candidate: ambiguous, refuse */
+            cand = -2;
+            break;
+        }
+        cand = i;
+    }
+
+    if (cand >= 0) {
+        task_struct_offset.mm_offset = cand;
+        task_struct_offset.active_mm_offset = cand + 8;
+    }
+
+out:
+    if (mm_cur) kfunc_mmput(mm_cur);
+    if (mm_a) kfunc_mmput(mm_a);
+    return cand >= 0 ? cand : -1;
+}
+
+int wx_derive_runtime_anchors(void)
+{
+    struct task_struct *task1, *task2;
+    int comm_off;
+
+    if (wx_init_task)
+        goto mm_phase; /* kallsyms gave us init_task: only mm offsets may be missing */
+
+    if (!wx_find_task_by_vpid) {
+        pr_err("wxshadow: find_task_by_vpid unavailable, cannot derive anchors\n");
+        return -1;
+    }
+
+    task1 = wx_find_task_by_vpid(1);
+    task2 = wx_find_task_by_vpid(2);
+    if (!task1 || !task2) {
+        pr_err("wxshadow: anchor tasks unavailable (init=%px kthreadd=%px)\n",
+               task1, task2);
+        return -1;
+    }
+
+    if (task_struct_offset.comm_offset <= 0) {
+        comm_off = derive_comm_offset(task1, task2);
+        if (comm_off < 0) {
+            pr_err("wxshadow: comm offset derivation failed\n");
+            return -1;
+        }
+        task_struct_offset.comm_offset = comm_off;
+        pr_info("wxshadow: comm_offset = 0x%x (derived)\n", comm_off);
+    }
+    comm_off = task_struct_offset.comm_offset;
+
+    wx_init_task = derive_init_task_via_list(task1, comm_off);
+    if (!wx_init_task) {
+        pr_err("wxshadow: init_task derivation failed\n");
+        return -1;
+    }
+    pr_info("wxshadow: init_task = %px (derived, tasks_offset=0x%x)\n",
+            wx_init_task, task_struct_offset.tasks_offset);
+
+mm_phase:
+    if (task_struct_offset.active_mm_offset <= 0) {
+        /* framework needs init_mm (data symbol) — derive via dual user task */
+        task1 = wx_find_task_by_vpid ? wx_find_task_by_vpid(1) : NULL;
+        if (!task1) {
+            pr_err("wxshadow: no anchor for mm offset derivation\n");
+            return -1;
+        }
+        if (derive_mm_offsets(task1) < 0) {
+            pr_err("wxshadow: mm/active_mm offset derivation failed\n");
+            return -1;
+        }
+        pr_info("wxshadow: mm_offset = 0x%x, active_mm_offset = 0x%x (derived)\n",
+                task_struct_offset.mm_offset, task_struct_offset.active_mm_offset);
+    }
+
+    return 0;
+}
+
+
 /* ========== mm_struct offset scanning ========== */
 
 /* Check if a kernel address is valid and readable */
@@ -459,6 +682,83 @@ static inline bool safe_read_str(unsigned long addr, char *buf, size_t maxlen)
     return true;
 }
 
+/* Probe-safe walk of a CANDIDATE top-level page table for a user VA.
+ * Every level is read via probe_read and every intermediate table address is
+ * validated as KVA before use — safe to feed arbitrary mm_struct fields.
+ * Returns PA on success, 0 on failure. */
+static unsigned long safe_walk_user_table(unsigned long table, unsigned long uaddr)
+{
+    u64 desc;
+    int level;
+    u64 tcr;
+    int t0sz, tg0;
+    int granule_shift, stride;
+    int va_bits, levels, start_level;
+    u64 t = table;
+
+    if (!is_kva(t))
+        return 0;
+
+    /* Read TCR_EL1 to get T0SZ and TG0 */
+    asm volatile("mrs %0, tcr_el1" : "=r"(tcr));
+
+    t0sz = tcr & 0x3f;
+    tg0 = (tcr >> 14) & 0x3;
+
+    /* Decode TG0: 0=4KB, 1=64KB, 2=16KB */
+    switch (tg0) {
+    case 0:  /* 4KB */
+        granule_shift = 12;
+        stride = 9;
+        break;
+    case 1:  /* 64KB */
+        granule_shift = 16;
+        stride = 13;
+        break;
+    case 2:  /* 16KB */
+        granule_shift = 14;
+        stride = 11;
+        break;
+    default:
+        granule_shift = 12;
+        stride = 9;
+    }
+
+    va_bits = 64 - t0sz;
+    levels = (va_bits - granule_shift + stride - 1) / stride;
+    start_level = 4 - levels;
+
+    for (level = start_level; level <= 3; level++) {
+        int shift = granule_shift + stride * (3 - level);
+        int idx = (uaddr >> shift) & ((1 << stride) - 1);
+
+        /* Read descriptor via probe (candidate may not be a real table) */
+        if (!safe_read_u64(t + idx * 8, &desc))
+            return 0;
+
+        /* Check valid bit */
+        if (!(desc & 1))
+            return 0;
+
+        {
+            unsigned long next_pa = desc & 0x0000FFFFFFFFF000UL;
+
+            if (level < 3 && (desc & 2)) {
+                /* Table descriptor - convert PA to KVA for next level */
+                t = phys_to_virt_safe(next_pa);
+                if (!is_kva(t))
+                    return 0;
+            } else {
+                /* Block or page entry - translation complete */
+                unsigned long offset_mask = (1UL << shift) - 1;
+                return next_pa | (uaddr & offset_mask);
+            }
+        }
+    }
+
+    return 0;
+}
+
 int scan_mm_struct_offsets(void)
 {
     /*
@@ -468,9 +768,66 @@ int scan_mm_struct_offsets(void)
     pr_info("wxshadow: using KP framework mm_struct_offset.pgd_offset = 0x%x\n",
             mm_struct_offset.pgd_offset);
 
-    if (mm_struct_offset.pgd_offset < 0) {
-        pr_err("wxshadow: KP framework did not detect pgd_offset!\n");
-        return -1;
+    if (mm_struct_offset.pgd_offset >= 0)
+        return 0;
+
+    /*
+     * Derivation for kernels without KALLSYMS_ALL (no init_mm, so the KP
+     * framework cannot detect pgd_offset). On msm-4.19 sp_el0 holds the
+     * task_struct pointer (thread_info-in-task, see KP resolve_current),
+     * NOT the user SP, so the old user-VA walk cannot be used here.
+     *
+     * Ground truth instead: TTBR0_EL1. This code runs in kpctl's syscall
+     * context (process context, user mm active), and redfin (SM7250) is
+     * "Not affected" by Meltdown, so KPTI is disabled and TTBR0_EL1 holds
+     * the current process's user pgd physical address. The mm_struct
+     * field whose linear-map PA matches TTBR0 is mm->pgd.
+     */
+    {
+        struct mm_struct *mm;
+        unsigned long ttbr0, pgd_pa;
+        int i, cand = -1, ncand = 0;
+
+        asm volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+        asm volatile("isb");
+        pgd_pa = ttbr0 & 0x0000FFFFFFFFF000UL; /* strip ASID[63:48], CnP, low bits */
+        if (!pgd_pa) {
+            pr_err("wxshadow: pgd derivation: ttbr0_el1=0x%lx has no PA\n", ttbr0);
+            return -1;
+        }
+        pr_info("wxshadow: pgd derivation: ttbr0_el1=0x%lx -> pgd_pa=0x%lx\n",
+                ttbr0, pgd_pa);
+
+        mm = kfunc_get_task_mm(current);
+        if (!mm) {
+            pr_err("wxshadow: pgd derivation: current has no mm\n");
+            return -1;
+        }
+
+        for (i = 0; i + 8 <= 0xb0; i += 8) {
+            u64 p, pa;
+
+            if (!safe_read_u64((unsigned long)mm + i, &p))
+                continue;
+            if (!is_kva(p) || (p & 0xfffUL))
+                continue;
+
+            pa = kaddr_to_phys((unsigned long)p);
+            if (pa == pgd_pa) {
+                cand = i;
+                ncand++;
+            }
+        }
+
+        kfunc_mmput(mm);
+
+        if (cand < 0 || ncand != 1) {
+            pr_err("wxshadow: pgd_offset derivation failed (cand=%d n=%d, "
+                   "KPTI trampoline pgd mismatch?)\n", cand, ncand);
+            return -1;
+        }
+        mm_struct_offset.pgd_offset = cand;
+        pr_info("wxshadow: pgd_offset = 0x%x (derived via TTBR0_EL1)\n", cand);
     }
 
     return 0;
@@ -718,75 +1075,13 @@ int detect_task_struct_offsets(void)
 static unsigned long walk_pgtable_uaddr(void *mm, unsigned long uaddr)
 {
     u64 *table;
-    u64 desc;
-    int level;
-    u64 tcr;
-    int t0sz, tg0;
-    int granule_shift, stride;
-    int va_bits, levels, start_level;
 
     /* Get PGD from mm - it's already a kernel virtual address */
     table = (u64 *)mm_pgd(mm);
     if (!table || !is_kva((unsigned long)table))
         return 0;
 
-    /* Read TCR_EL1 to get T0SZ and TG0 */
-    asm volatile("mrs %0, tcr_el1" : "=r"(tcr));
-
-    t0sz = tcr & 0x3f;
-    tg0 = (tcr >> 14) & 0x3;
-
-    /* Decode TG0: 0=4KB, 1=64KB, 2=16KB */
-    switch (tg0) {
-    case 0:  /* 4KB */
-        granule_shift = 12;
-        stride = 9;
-        break;
-    case 1:  /* 64KB */
-        granule_shift = 16;
-        stride = 13;
-        break;
-    case 2:  /* 16KB */
-        granule_shift = 14;
-        stride = 11;
-        break;
-    default:
-        granule_shift = 12;
-        stride = 9;
-    }
-
-    va_bits = 64 - t0sz;
-    levels = (va_bits - granule_shift + stride - 1) / stride;
-    start_level = 4 - levels;
-
-    for (level = start_level; level <= 3; level++) {
-        int shift = granule_shift + stride * (3 - level);
-        int idx = (uaddr >> shift) & ((1 << stride) - 1);
-
-        /* Read descriptor directly (table is KVA) */
-        if (!safe_read_u64((unsigned long)&table[idx], &desc))
-            return 0;
-
-        /* Check valid bit */
-        if (!(desc & 1))
-            return 0;
-
-        unsigned long next_pa = desc & 0x0000FFFFFFFFF000UL;
-
-        /* Check if table or block/page entry */
-        if (level < 3 && (desc & 2)) {
-            /* Table descriptor - convert PA to KVA for next level */
-            table = (u64 *)phys_to_virt_safe(next_pa);
-            if (!is_kva((unsigned long)table))
-                return 0;
-        } else {
-            /* Block or page entry - translation complete */
-            unsigned long offset_mask = (1UL << shift) - 1;
-            return next_pa | (uaddr & offset_mask);
-        }
-    }
-
-    return 0;
+    return safe_walk_user_table((unsigned long)table, uaddr);
 }
 
 /*

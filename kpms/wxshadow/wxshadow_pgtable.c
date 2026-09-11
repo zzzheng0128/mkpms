@@ -415,6 +415,18 @@ static void wxshadow_tlbi_page(void *mm, unsigned long uaddr)
     int mode = tlb_flush_mode;
     const char *mode_str;
 
+    /*
+     * Barrier ordering — mirrors kernel flush_tlb_page() (arm64):
+     * the PTE store MUST be visible to other cores' page-table walkers
+     * BEFORE we invalidate. Without this dsb ishst, the TLBI can
+     * complete before the PTE write lands; a racing core then re-walks
+     * the table, caches the OLD translation AFTER the invalidation,
+     * and executes a permanently stale page (mixed shadow/original
+     * execution -> register/pointer corruption). msm-4.19 uses this
+     * fallback path (no kernel flush function), 5.10 GKI does not.
+     */
+    asm volatile("dsb ishst" : : : "memory");
+
     /* Build TLBI operand: ASID in bits [63:48], VA>>12 in bits [43:0] */
     tlbi_val = (asid << 48) | ((uaddr >> 12) & 0xFFFFFFFFFFFFUL);
 
@@ -439,14 +451,15 @@ static void wxshadow_tlbi_page(void *mm, unsigned long uaddr)
 
     case WX_TLB_MODE_AUTO:
     default:
-        /* Auto mode: use ASID if available, else broadcast */
-        if (asid != 0) {
-            asm volatile("tlbi vale1is, %0" : : "r"(tlbi_val) : "memory");
-            mode_str = "auto-precise";
-        } else {
-            asm volatile("tlbi vaale1is, %0" : : "r"(uaddr >> 12) : "memory");
-            mode_str = "auto-broadcast";
-        }
+        /*
+         * Auto mode: prefer the all-ASID broadcast. vaale1is is immune
+         * to ASID-width/encoding mismatches (8/16-bit ASID hardware,
+         * context.id formats) and only marginally broader than the
+         * precise variant. ASID-precise is only used when explicitly
+         * requested via WX_TLB_MODE_PRECISE.
+         */
+        asm volatile("tlbi vaale1is, %0" : : "r"(uaddr >> 12) : "memory");
+        mode_str = "auto-broadcast";
         break;
     }
 
