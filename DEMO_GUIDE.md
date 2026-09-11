@@ -71,8 +71,9 @@ rustfrida --pid <目标PID> -l /data/local/tmp/demo-openat-guard.js
 路径重定向、不隐藏 maps，也不修改其他 syscall。
 
 合并模块里的 `eredirect` 是另一条路径：它在 `do_filp_open` 层按规则改写目标路径，
-用于兼容旧实验。先用 `kpctl control mkpm 'eredirect list'` 查看规则，确认测试前缀
-后再添加；新手优先使用上面的 `demo-openat-guard`，因为它的影响范围更小、卸载更直观。
+用于兼容旧实验。直接控制时使用 `kpctl control mkpm 'eredirect <uid> addexact <from> <to>'`
+再执行 `hook`；兼容 demo 的菜单简称为 `redirect`，会自动在同一 App 内做关闭/开启前后
+对照。新手优先使用上面的 `demo-openat-guard`，因为它的影响范围更小、卸载更直观。
 
 ## hide 现有模块如何审计
 
@@ -113,10 +114,10 @@ bash examples/rustfrida-compat-app/run_demo_spawn.sh 15      # readlink UID 视�
 唯一入口会自动推送本机 `dyidre/tools/kpctl/kpctl`（可用 `KPCTL_HOST` 覆盖），加载
 `mkpm.kpm`，用 `kpctl control mkpm` 切换模块，并在 `runs/compat-demo/<时间戳>/`
 保存控制回显、RustFrida 输出和 `SUMMARY.txt`。inode 轮次下发
-`emaps addino <uid> rfcompat-mkpm-map 1`，然后由 compat demo 读取
-`/proc/self/maps`，runner 在规则仍启用时再用 root shell 读取同一进程的 maps，显示
-`app_inode`、`shell_inode` 和是否产生差异；两边不同才算按 UID 隔离的改写生效。
-两边相同会明确标记该 maps 读取路径未应用规则。boot_time 轮次对目标 UID 的
+`emaps addino <uid> rfcompat-mkpm-map 1`，然后由 compat demo 在规则关闭和开启时
+分别读取同一进程的 `/proc/self/maps`；摘要显示 `关闭=<原值>，开启=1` 才算改写生效，
+不依赖 root shell 读取已经被探针释放的临时 VMA。redirect 轮次同样先确认关闭时
+`open=-2`，再确认开启后读到 `mkpm-redirect-target`。boot_time 轮次对目标 UID 的
 `CLOCK_BOOTTIME` 输出减 600 秒，root shell 读取 `/proc/uptime` 作对照；全局系统时钟
 不变。readlink 轮次在应用私有目录创建 symlink，目标 UID 应得到 `ENOENT`，root shell
 应读到原始目标。Pixel6 上 runner 默认复用已加载 KPM，修改 KPM 后重启设备再加载；

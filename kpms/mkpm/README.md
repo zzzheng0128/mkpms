@@ -134,6 +134,7 @@ adb shell su -c "/data/local/tmp/kpctl unload mkpm"
 | `syscall read <off> <count>` | 读事件环（格式化输出） |
 | `syscall status` / `detach-all` | 状态 / 全部摘除 |
 | **ehide / eredirect / evm / emaps** | 与 dysvcpit 原版命令一致（首词子模块名） |
+| `eredirect <uid> addexact <from> <to>` + `hook` | 只对目标 UID 的精确路径做重定向；`addexact` 不带 PC 范围时也会生效 |
 | `emaps hook` / `unhook` / `addino` / `addpath` / `addboth` / `append` / `drop` / `addpathrxp` / `addpathaddr` / `del` / `clear` / `list` | maps 行改写规则（inode 替换 = addino） |
 | `boot uid <uid>` / `time <sec> [msec]` / `status` / `clear` / `off` | 目标 UID 的 `CLOCK_BOOTTIME` 输出偏移；`off` 摘除 syscall hook |
 

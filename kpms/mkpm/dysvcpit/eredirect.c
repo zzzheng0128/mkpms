@@ -212,19 +212,41 @@ static void range_clear(void)
     kf_spin_unlock(&g_ranges_lock);
 }
 
-static const struct so_range* range_find_by_pc(u64 pc)
+/* RCU 节点不能在解锁后继续解引用。原实现返回 g_ranges 中的指针，
+ * 调用方随后读取 name/start；控制线程同时执行 range clear/del 时会形成
+ * use-after-free，属于高频 redirect 下的内核崩溃风险。复制需要的字段，
+ * 把生命周期限制在当前调用栈。 */
+struct so_range_snapshot {
+    char name[64];
+    u64 start;
+};
+
+static bool range_snapshot_by_pc(u64 pc, struct so_range_snapshot *out)
 {
-    const struct so_range *hit = NULL;
+    bool found = false;
     struct so_range *r;
+
+    if (!kf_rcu_read_lock || !kf_rcu_read_unlock)
+        return false;
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
     kf_rcu_read_lock();
     list_for_each_entry_rcu(r, &g_ranges, list) {
         if ((!r->start && !r->end) || (r->start <= pc && pc <= r->end)) {
-            hit = r;
+            if (out) {
+                size_t n = strlen(r->name);
+                if (n >= sizeof(out->name)) n = sizeof(out->name) - 1;
+                memcpy(out->name, r->name, n);
+                out->name[n] = '\0';
+                out->start = r->start;
+            }
+            found = true;
             break;
         }
     }
     kf_rcu_read_unlock();
-    return hit;
+    return found;
 }
 
 static void free_rule_rcu(struct rcu_head *rcu)
@@ -310,22 +332,47 @@ static bool pc_in_range(u64 pc, u64 beg, u64 end)
     return false;
 }
 
-static const struct redir_rule* match_rule_rcu(const char *path, u64 pc)
+struct redir_rule_snapshot {
+    char to[PATH_MAX];
+    u32 flags;
+    u64 pc_begin;
+    u64 pc_end;
+};
+
+static bool match_rule_snapshot(const char *path, u64 pc,
+                                struct redir_rule_snapshot *out)
 {
-    const struct redir_rule *hit = NULL;
+    bool found = false;
+    if (!path || !kf_rcu_read_lock || !kf_rcu_read_unlock)
+        return false;
+    if (out) memset(out, 0, sizeof(*out));
     kf_rcu_read_lock();
     struct redir_rule *r;
     list_for_each_entry_rcu(r, &g_redir_rules, list) {
         if (!pc_in_range(pc, r->pc_begin, r->pc_end))
             continue;
         if (r->flags & REDIR_MATCH_EXACT) {
-            if (!strcmp(path, r->from)) { hit = r; break; }
+            if (!strcmp(path, r->from)) found = true;
         } else if (r->flags & REDIR_MATCH_PREFIX) {
-            if (strncmp(path, r->from, r->from_len) == 0) { hit = r; break; }
+            if (strncmp(path, r->from, r->from_len) == 0) found = true;
+        }
+        if (found) {
+            /* Fail closed for a path that cannot fit the bounded snapshot. */
+            size_t n = strlen(r->to);
+            if (n >= PATH_MAX) {
+                found = false;
+            } else if (out) {
+                memcpy(out->to, r->to, n);
+                out->to[n] = '\0';
+                out->flags = r->flags;
+                out->pc_begin = r->pc_begin;
+                out->pc_end = r->pc_end;
+            }
+            break;
         }
     }
     kf_rcu_read_unlock();
-    return hit;
+    return found;
 }
 #define LOOKUP_FOLLOW 0x0001
 static bool resolve_if_proc_fd(const char *in, char *out, size_t outsz)
@@ -417,18 +464,17 @@ static struct file *replace_do_filp_open(int dfd, struct filename *pathname, con
         path_for_print = realbuf;
     }    
 
-    const struct so_range *hit = range_find_by_pc(pc);
-    if (!hit){
-        return backup_do_filp_open(dfd, pathname, op);
-    }
-    const char *so_name = hit ? hit->name : "unknown";
-    u64 offset = hit ? (pc - hit->start) : pc;
-    u64 caller_offset = io_caller_pc(regs,hit->start);
+    struct so_range_snapshot range;
+    bool has_range = range_snapshot_by_pc(pc, &range);
+    const char *so_name = has_range ? range.name : "unknown";
+    u64 offset = has_range ? (pc - range.start) : pc;
+    u64 caller_offset = has_range ? io_caller_pc(regs, range.start) : 0;
     if (g_print_only){
         // if (strstr(so_name, "libc.so")){
         //     return backup_do_filp_open(dfd, pathname, op);
         // }
-        logkd("[IO] pc=0x%llx so=%s off=0x%llx offup=0x%llx path=%s", pc, so_name, offset, caller_offset,path_for_print);
+        if (has_range)
+            logkd("[IO] pc=0x%llx so=%s off=0x%llx offup=0x%llx path=%s", pc, so_name, offset, caller_offset,path_for_print);
         return backup_do_filp_open(dfd, pathname, op);
     }
     
@@ -437,13 +483,13 @@ static struct file *replace_do_filp_open(int dfd, struct filename *pathname, con
         return backup_do_filp_open(dfd, pathname, op);
 
     // 查规则
-    const struct redir_rule *rule = match_rule_rcu(orig, pc);
-    if (!rule)
+    struct redir_rule_snapshot rule;
+    if (!match_rule_snapshot(orig, pc, &rule))
         return backup_do_filp_open(dfd, pathname, op);
 
     // 命中规则：构造新的 filename，直接传给备份函数
     // 注意：不用先打开原路径再 fput，避免多余开销 & 竞态
-    struct filename *newname = kf__getname_kernel(rule->to);
+    struct filename *newname = kf__getname_kernel(rule.to);
     if (IS_ERR(newname)) {
         // 构造失败，回退到原始行为
         return backup_do_filp_open(dfd, pathname, op);
@@ -458,9 +504,9 @@ static struct file *replace_do_filp_open(int dfd, struct filename *pathname, con
 
     // 打印一次日志方便核对
     if (!IS_ERR(filp)) {
-        logkd("redirect: '%s' => '%s' (pc=0x%llx)", orig, rule->to, pc);
+        logkd("redirect: '%s' => '%s' (pc=0x%llx)", orig, rule.to, pc);
     } else {
-        logkd("redirect FAIL: '%s' => '%s' (pc=0x%llx, err=%ld)", orig, rule->to, pc, PTR_ERR(filp));
+        logkd("redirect FAIL: '%s' => '%s' (pc=0x%llx, err=%ld)", orig, rule.to, pc, PTR_ERR(filp));
     }
     return filp;
 }
@@ -630,8 +676,12 @@ int eredirect_main(struct opts *opts)
         const char *to   = opts->args[4];
         u32 flags = !strcmp(opts->args[2], "addprefix") ? REDIR_MATCH_PREFIX : REDIR_MATCH_EXACT;
         u64 beg = 0, end = 0;
-        if (opts->size >= 5) kf__kstrtoull(opts->args[5], 16, &beg);
-        if (opts->size >= 6) kf__kstrtoull(opts->args[6], 16, &end);
+        /* opts[0..4] 是最短 addexact 的合法范围；可选 PC 范围从
+         * opts[5]/opts[6] 开始，不能用 size>=5 去访问 opts[5]。
+         * 旧代码在不带 PC 参数的普通 addexact 下越界读，KPM 内核态
+         * 控制路径可能因此直接 panic。 */
+        if (opts->size >= 6) kf__kstrtoull(opts->args[5], 16, &beg);
+        if (opts->size >= 7) kf__kstrtoull(opts->args[6], 16, &end);
         return add_or_replace_rule(from, to, flags, beg, end);
     }
 
